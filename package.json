@@ -1,0 +1,12 @@
+{
+  "name": "douyin-comment-fetcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fetch comments for Douyin creator works from the creator center page.",
+  "scripts": {
+    "comments": "node ./src/fetch-douyin-comments.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}
