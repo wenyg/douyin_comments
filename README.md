@@ -89,6 +89,7 @@ npm run comments -- \
 - 作品 `item_id` 通过拦截 `/aweme/v1/creator/item/list/` 响应获取；这是文档里明确提到的关键点。
 - 如果网络慢，`--list-works` 会先等待接口响应；接口仍未命中时，再用侧边栏 DOM 做标题级兜底，不再直接空退出。
 - 按 `--work-id` 或 `--work-title` 抓评论时，脚本会在匹配到目标作品后提前停止滚动，不再遍历完整个作品列表。
+- 作品选择现在优先按标题精确匹配；如果同标题作品无法用发布时间区分，脚本会直接报歧义，建议改用 `--work-id`。
 - 回复模式会先检查当前评论是否已经存在“作者”回复；如果存在则跳过，避免重复回复。
 - `--reply-plan-file` 支持为每条目标评论单独指定 `replyMessage`；示例格式见 [reply-plan.example.json](/Users/yangguang.wen/douyin_plugin_back/reply-plan.example.json)。
 - `reply-plan-file` 中 `commentText` 必填，`username` 和 `publishText` 选填；填得越全，定向匹配越稳。

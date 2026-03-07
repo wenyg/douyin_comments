@@ -200,6 +200,10 @@ function formatUnixSeconds(rawValue) {
   return `${year}-${month}-${day} ${hours}:${minutes}`;
 }
 
+function normalizeLookupText(value = "") {
+  return normalizeText(value).toLowerCase();
+}
+
 function normalizeReplyPlanEntry(rawEntry, index, fallbackReplyMessage) {
   if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
     throw new Error(`reply plan item ${index + 1} must be an object`);
@@ -484,6 +488,8 @@ async function inspectWorksInSideSheet(sideSheet) {
       const publishText = lines.find((line) => line.includes("发布于")) || "";
       const title =
         lines.find((line) => line && !line.includes("发布于")) || `作品-${index + 1}`;
+      node.setAttribute("data-codex-work-title-key", normalize(title).toLowerCase());
+      node.setAttribute("data-codex-work-publish-key", normalize(publishText).toLowerCase());
 
       return {
         index,
@@ -649,9 +655,9 @@ function findExactTargetWork(works, workId, workTitle) {
     return null;
   }
 
-  const normalizedTitle = normalizeText(workTitle).toLowerCase();
+  const normalizedTitle = normalizeLookupText(workTitle);
   return (
-    works.find((work) => normalizeText(work.title).toLowerCase() === normalizedTitle) ?? null
+    works.find((work) => normalizeLookupText(work.title) === normalizedTitle) ?? null
   );
 }
 
@@ -694,19 +700,6 @@ function getSelectedWorkOutput(work) {
   };
 }
 
-async function scrollWorkCardIntoView(sideSheet, title) {
-  await sideSheet.evaluate((element, titleNeedle) => {
-    const compact = (value = "") => value.replace(/\s+/g, "");
-    const target = Array.from(element.querySelectorAll("[data-codex-work-card]")).find((child) => {
-      return child instanceof HTMLElement && compact(child.innerText || "").includes(titleNeedle);
-    });
-
-    if (target instanceof HTMLElement) {
-      target.scrollIntoView({ block: "center" });
-    }
-  }, title.replace(/\s+/g, ""));
-}
-
 async function fetchAllWorksWithRetry(page, workCollector, options) {
   try {
     return await fetchAllWorks(page, workCollector, options);
@@ -728,6 +721,7 @@ async function findTargetWork(page, workCollector, options) {
   let previousApiCount = -1;
   let previousResponseCount = -1;
   let latestDomWorks = [];
+  let bestApiMatch = null;
 
   while (Date.now() - startedAt < options.timeoutMs) {
     latestDomWorks = await extractWorksFromSideSheet(sideSheet);
@@ -752,10 +746,12 @@ async function findTargetWork(page, workCollector, options) {
       options.workTitle
     );
     const exactApiMatch = findExactTargetWork(apiWorks, options.workId, options.workTitle);
-    const resolvedMatch = mergeWorkRecords(exactDomMatch, exactApiMatch);
+    if (exactApiMatch) {
+      bestApiMatch = mergeWorkRecords(bestApiMatch, exactApiMatch);
+    }
 
-    if (resolvedMatch) {
-      return resolvedMatch;
+    if (exactDomMatch) {
+      return mergeWorkRecords(exactDomMatch, exactApiMatch, bestApiMatch);
     }
 
     previousDomCount = domCount;
@@ -778,6 +774,14 @@ async function findTargetWork(page, workCollector, options) {
   }
 
   const fallbackWorks = mergeWorkLists(workCollector.values(), latestDomWorks);
+  if (bestApiMatch) {
+    const fallbackMatch = pickTargetWork(
+      mergeWorkLists([bestApiMatch], fallbackWorks),
+      options.workId,
+      options.workTitle
+    );
+    return mergeWorkRecords(bestApiMatch, fallbackMatch);
+  }
   return pickTargetWork(fallbackWorks, options.workId, options.workTitle);
 }
 
@@ -807,16 +811,16 @@ function pickTargetWork(works, workId, workTitle) {
     return null;
   }
 
-  const normalizedTitle = normalizeText(workTitle).toLowerCase();
+  const normalizedTitle = normalizeLookupText(workTitle);
   const exactMatch = works.find(
-    (work) => normalizeText(work.title).toLowerCase() === normalizedTitle
+    (work) => normalizeLookupText(work.title) === normalizedTitle
   );
   if (exactMatch) {
     return exactMatch;
   }
 
   const partialMatches = works.filter((work) =>
-    normalizeText(work.title).toLowerCase().includes(normalizedTitle)
+    normalizeLookupText(work.title).includes(normalizedTitle)
   );
 
   if (partialMatches.length === 1) {
@@ -841,12 +845,10 @@ async function selectWorkFromSideSheet(page, targetWork, options) {
 
   while (Date.now() - startedAt < options.timeoutMs) {
     await inspectWorksInSideSheet(sideSheet);
-    await scrollWorkCardIntoView(sideSheet, targetWork.title);
-
-    const found = await sideSheet.evaluate((element, work) => {
-      const compact = (value = "") => value.replace(/\s+/g, "");
-      const titleNeedle = compact(work.title);
-      const publishNeedle = compact(work.publishText);
+    const selectionState = await sideSheet.evaluate((element, work) => {
+      const normalize = (value = "") => value.replace(/\s+/g, " ").trim().toLowerCase();
+      const targetTitle = normalize(work.title);
+      const targetPublish = normalize(work.publishText);
 
       for (const child of Array.from(element.querySelectorAll("[data-codex-target-work]"))) {
         if (child instanceof HTMLElement) {
@@ -854,49 +856,58 @@ async function selectWorkFromSideSheet(page, targetWork, options) {
         }
       }
 
-      const cards = Array.from(element.querySelectorAll("[data-codex-work-card]"));
-
-      for (const child of cards) {
-        if (!(child instanceof HTMLElement)) {
-          continue;
+      const cards = Array.from(element.querySelectorAll("[data-codex-work-card]")).filter(
+        (child) => child instanceof HTMLElement
+      );
+      const exactTitleMatches = cards.filter((child) => {
+        return child.getAttribute("data-codex-work-title-key") === targetTitle;
+      });
+      const publishCompatibleMatches = exactTitleMatches.filter((child) => {
+        const publishKey = child.getAttribute("data-codex-work-publish-key") || "";
+        if (!targetPublish) {
+          return true;
         }
+        return (
+          publishKey === targetPublish ||
+          publishKey.includes(targetPublish) ||
+          targetPublish.includes(publishKey)
+        );
+      });
 
-        const text = compact(child.innerText || "");
-        if (!text.includes(titleNeedle)) {
-          continue;
-        }
+      const finalMatches =
+        publishCompatibleMatches.length > 0 ? publishCompatibleMatches : exactTitleMatches;
 
-        if (publishNeedle && !text.includes(publishNeedle)) {
-          continue;
-        }
-
-        child.setAttribute("data-codex-target-work", "true");
-        return true;
+      if (finalMatches.length === 1) {
+        finalMatches[0].setAttribute("data-codex-target-work", "true");
+        return {
+          status: "found"
+        };
       }
 
-      for (const child of cards) {
-        if (!(child instanceof HTMLElement)) {
-          continue;
-        }
-
-        const text = compact(child.innerText || "");
-        if (!text.includes(titleNeedle)) {
-          continue;
-        }
-
-        child.setAttribute("data-codex-target-work", "true");
-        return true;
+      if (finalMatches.length > 1) {
+        return {
+          status: "ambiguous",
+          count: finalMatches.length
+        };
       }
 
-      return false;
+      return {
+        status: "not_found"
+      };
     }, targetWork);
 
-    if (found) {
+    if (selectionState.status === "found") {
       const workCard = sideSheet.locator('[data-codex-target-work="true"]').first();
       await workCard.scrollIntoViewIfNeeded();
       await workCard.click();
       await page.waitForTimeout(1800);
       return;
+    }
+
+    if (selectionState.status === "ambiguous") {
+      throw new Error(
+        `Multiple visible works matched title "${targetWork.title}". Please use --work-id for an exact selection.`
+      );
     }
 
     const scrollState = await sideSheet.evaluate((element) => {
