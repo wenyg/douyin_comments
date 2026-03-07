@@ -7,6 +7,7 @@
 - 列出创作者中心当前账号下的全部作品
 - 按 `item_id` 或标题选择作品
 - 抓取作品评论并导出为 JSON
+- 自动回复未被作者回复过的评论
 - 默认复用本地浏览器用户目录，便于手动登录一次后持续使用
 
 ## 安装
@@ -40,11 +41,36 @@ npm run comments -- \
   --output comments-output/work-comments.json
 ```
 
+自动回复未回复评论：
+
+```bash
+npm run comments -- \
+  --work-title "作品标题" \
+  --reply-message "感谢支持，我们会继续加油" \
+  --reply-limit 20 \
+  --output comments-output/reply-result.json
+```
+
+按评论内容定向回复：
+
+```bash
+npm run comments -- \
+  --work-title "作品标题" \
+  --reply-plan-file ./reply-plan.example.json \
+  --output comments-output/reply-plan-result.json
+```
+
 常用参数：
 
 - `--list-works`：只拉取并输出作品列表
 - `--work-id <id>`：按作品 `item_id` 选择
 - `--work-title <title>`：按标题选择，优先精确匹配
+- `--reply-message <text>`：开启回复模式，按给定文案回复未回复评论
+- `--reply-plan-file <path>`：按 JSON 文件中的匹配规则，给特定评论回复指定文案
+- `--reply-limit <n>`：最多发送多少条回复，默认 `20`
+- `--reply-timeout-ms <ms>`：单条回复流程最大等待时间，默认 `30000`
+- `--reply-settle-ms <ms>`：发送后等待页面刷新，默认 `1800`
+- `--reply-type-delay-ms <ms>`：逐字输入延迟，默认 `100`
 - `--limit <n>`：最多输出多少条评论，默认 `200`
 - `--navigation-timeout-ms <ms>`：页面导航超时，默认 `60000`
 - `--ui-timeout-ms <ms>`：关键页面元素等待超时，默认 `30000`
@@ -63,5 +89,8 @@ npm run comments -- \
 - 作品 `item_id` 通过拦截 `/aweme/v1/creator/item/list/` 响应获取；这是文档里明确提到的关键点。
 - 如果网络慢，`--list-works` 会先等待接口响应；接口仍未命中时，再用侧边栏 DOM 做标题级兜底，不再直接空退出。
 - 按 `--work-id` 或 `--work-title` 抓评论时，脚本会在匹配到目标作品后提前停止滚动，不再遍历完整个作品列表。
+- 回复模式会先检查当前评论是否已经存在“作者”回复；如果存在则跳过，避免重复回复。
+- `--reply-plan-file` 支持为每条目标评论单独指定 `replyMessage`；示例格式见 [reply-plan.example.json](/Users/yangguang.wen/douyin_plugin_back/reply-plan.example.json)。
+- `reply-plan-file` 中 `commentText` 必填，`username` 和 `publishText` 选填；填得越全，定向匹配越稳。
 - 其他依赖网络或页面渲染的步骤也已经开放超时参数，包括页面打开、作品侧边栏出现、评论区出现和评论抓取总时长。
 - 评论抓取仍然基于页面 DOM，页面结构变动后可能需要微调选择器或提取规则。

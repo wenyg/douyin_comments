@@ -19,6 +19,12 @@ Options:
   --list-works              Fetch and print all works from the side sheet
   --work-id <item_id>       Select a work by item_id
   --work-title <title>      Select a work by title
+  --reply-message <text>    Reply to unreplied comments with the given text
+  --reply-plan-file <path>  Reply to specific comments from a JSON plan file
+  --reply-limit <n>         Max number of replies to send (default: 20)
+  --reply-timeout-ms <ms>   Max wait for one reply flow (default: 30000)
+  --reply-settle-ms <ms>    Wait after sending one reply (default: 1800)
+  --reply-type-delay-ms <ms> Delay between typed chars (default: 100)
   --limit <n>               Max number of comments to collect (default: 200)
   --navigation-timeout-ms <ms>  Max wait for page navigation (default: 60000)
   --ui-timeout-ms <ms>      Max wait for key page elements to appear (default: 30000)
@@ -54,6 +60,12 @@ function parseArgs(argv) {
     output: "",
     workId: "",
     workTitle: "",
+    replyMessage: "",
+    replyPlanFile: "",
+    replyLimit: 20,
+    replyTimeoutMs: 30000,
+    replySettleMs: 1800,
+    replyTypeDelayMs: 100,
     listWorks: false,
     limit: 200,
     navigationTimeoutMs: 60000,
@@ -82,6 +94,30 @@ function parseArgs(argv) {
         break;
       case "--work-title":
         args.workTitle = normalizeText(argv[index + 1] ?? "");
+        index += 1;
+        break;
+      case "--reply-message":
+        args.replyMessage = String(argv[index + 1] ?? "").trim();
+        index += 1;
+        break;
+      case "--reply-plan-file":
+        args.replyPlanFile = path.resolve(argv[index + 1] ?? "");
+        index += 1;
+        break;
+      case "--reply-limit":
+        args.replyLimit = toPositiveInteger(argv[index + 1], "--reply-limit");
+        index += 1;
+        break;
+      case "--reply-timeout-ms":
+        args.replyTimeoutMs = toPositiveInteger(argv[index + 1], "--reply-timeout-ms");
+        index += 1;
+        break;
+      case "--reply-settle-ms":
+        args.replySettleMs = toPositiveInteger(argv[index + 1], "--reply-settle-ms");
+        index += 1;
+        break;
+      case "--reply-type-delay-ms":
+        args.replyTypeDelayMs = toPositiveInteger(argv[index + 1], "--reply-type-delay-ms");
         index += 1;
         break;
       case "--limit":
@@ -162,6 +198,82 @@ function formatUnixSeconds(rawValue) {
   const minutes = String(date.getMinutes()).padStart(2, "0");
 
   return `${year}-${month}-${day} ${hours}:${minutes}`;
+}
+
+function normalizeReplyPlanEntry(rawEntry, index, fallbackReplyMessage) {
+  if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+    throw new Error(`reply plan item ${index + 1} must be an object`);
+  }
+
+  const username = normalizeText(String(rawEntry.username ?? ""));
+  const commentText = normalizeText(
+    String(rawEntry.commentText ?? rawEntry.comment ?? rawEntry.text ?? "")
+  );
+  const publishText = normalizeText(
+    String(rawEntry.publishText ?? rawEntry.publish ?? rawEntry.time ?? "")
+  );
+  const replyMessage = String(rawEntry.replyMessage ?? fallbackReplyMessage ?? "").trim();
+
+  if (!commentText) {
+    throw new Error(`reply plan item ${index + 1} requires commentText`);
+  }
+
+  if (!replyMessage) {
+    throw new Error(
+      `reply plan item ${index + 1} requires replyMessage, or provide --reply-message as fallback`
+    );
+  }
+
+  return {
+    id: index + 1,
+    username,
+    commentText,
+    publishText,
+    replyMessage
+  };
+}
+
+function getReplyPlanIdentity(entry) {
+  return [
+    normalizeText(entry.username).toLowerCase(),
+    normalizeText(entry.commentText).toLowerCase(),
+    normalizeText(entry.publishText).toLowerCase()
+  ].join("|");
+}
+
+async function loadReplyPlan(replyPlanFile, fallbackReplyMessage) {
+  const rawContent = await fs.readFile(replyPlanFile, "utf8");
+  let parsed;
+
+  try {
+    parsed = JSON.parse(rawContent);
+  } catch (error) {
+    throw new Error(
+      `Failed to parse reply plan JSON at ${replyPlanFile}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  const rawEntries = Array.isArray(parsed) ? parsed : parsed?.replies;
+  if (!Array.isArray(rawEntries)) {
+    throw new Error("reply plan file must be a JSON array or an object with a replies array");
+  }
+
+  const plans = rawEntries.map((entry, index) =>
+    normalizeReplyPlanEntry(entry, index, fallbackReplyMessage)
+  );
+
+  const seen = new Set();
+  for (const plan of plans) {
+    const identity = getReplyPlanIdentity(plan);
+    if (seen.has(identity)) {
+      throw new Error(
+        `Duplicate reply plan target detected for username="${plan.username}" commentText="${plan.commentText}" publishText="${plan.publishText}"`
+      );
+    }
+    seen.add(identity);
+  }
+
+  return plans;
 }
 
 function normalizeWork(rawWork) {
@@ -930,6 +1042,10 @@ async function extractCommentSnapshot(page) {
     const controlPattern = /^(回复|发送|收起)$/;
     const pureNumberPattern = /^\d+$/;
 
+    for (const marked of root.querySelectorAll("[data-codex-comment-block]")) {
+      marked.removeAttribute("data-codex-comment-block");
+    }
+
     const collectBlocks = () => {
       const explicitBlocks = Array.from(root.querySelectorAll("[comment-item]"));
       if (explicitBlocks.length > 0) {
@@ -982,7 +1098,11 @@ async function extractCommentSnapshot(page) {
     };
 
     return collectBlocks()
-      .map((block, order) => {
+      .map((block, domIndex) => {
+        if (block instanceof HTMLElement) {
+          block.setAttribute("data-codex-comment-block", String(domIndex));
+        }
+
         const rawLines = (block.innerText || "")
           .split(/\n+/)
           .map((line) => normalize(line))
@@ -1031,6 +1151,7 @@ async function extractCommentSnapshot(page) {
         );
 
         return {
+          domIndex,
           username,
           commentText,
           publishText,
@@ -1039,11 +1160,351 @@ async function extractCommentSnapshot(page) {
           extraLines,
           rawText: normalize(block.innerText || ""),
           signature: [username, commentText, publishText].map(normalize).join("|"),
-          order
+          order: domIndex
         };
       })
       .filter(Boolean);
   });
+}
+
+function addCommentsFromSnapshot(commentsBySignature, snapshot) {
+  let additions = 0;
+
+  for (const comment of snapshot) {
+    if (!comment.signature || commentsBySignature.has(comment.signature)) {
+      continue;
+    }
+
+    commentsBySignature.set(comment.signature, comment);
+    additions += 1;
+  }
+
+  return additions;
+}
+
+function matchReplyPlan(comment, replyPlans, processedPlanIds) {
+  if (!Array.isArray(replyPlans) || replyPlans.length === 0) {
+    return null;
+  }
+
+  const commentUsername = normalizeText(comment.username).toLowerCase();
+  const commentText = normalizeText(comment.commentText).toLowerCase();
+  const commentPublishText = normalizeText(comment.publishText).toLowerCase();
+
+  for (const plan of replyPlans) {
+    if (processedPlanIds.has(plan.id)) {
+      continue;
+    }
+
+    if (normalizeText(plan.commentText).toLowerCase() !== commentText) {
+      continue;
+    }
+
+    if (plan.username && normalizeText(plan.username).toLowerCase() !== commentUsername) {
+      continue;
+    }
+
+    if (plan.publishText && normalizeText(plan.publishText).toLowerCase() !== commentPublishText) {
+      continue;
+    }
+
+    return plan;
+  }
+
+  return null;
+}
+
+function getNextReplyTarget(snapshot, options, processedSignatures, processedPlanIds) {
+  if (options.replyPlanMode) {
+    if (!Array.isArray(options.replyPlans) || options.replyPlans.length === 0) {
+      return null;
+    }
+
+    for (const comment of snapshot) {
+      if (!comment.signature || processedSignatures.has(comment.signature)) {
+        continue;
+      }
+
+      const plan = matchReplyPlan(comment, options.replyPlans, processedPlanIds);
+      if (!plan) {
+        continue;
+      }
+
+      return {
+        comment,
+        plan,
+        replyMessage: plan.replyMessage
+      };
+    }
+
+    return null;
+  }
+
+  if (!Array.isArray(options.replyPlans) || options.replyPlans.length === 0) {
+    const comment = snapshot.find(
+      (candidate) => candidate.signature && !processedSignatures.has(candidate.signature)
+    );
+    if (!comment) {
+      return null;
+    }
+
+    return {
+      comment,
+      plan: null,
+      replyMessage: options.replyMessage
+    };
+  }
+
+  return null;
+}
+
+async function inspectCommentActions(commentLocator) {
+  return commentLocator.evaluate((root) => {
+    const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
+
+    for (const marked of root.querySelectorAll("[data-codex-toggle-action]")) {
+      marked.removeAttribute("data-codex-toggle-action");
+    }
+
+    for (const marked of root.querySelectorAll("[data-codex-reply-action]")) {
+      marked.removeAttribute("data-codex-reply-action");
+    }
+
+    const candidates = Array.from(root.querySelectorAll("button, div, span"));
+    const toggleCandidate = candidates.find((node) => {
+      const text = normalize(node.textContent || "");
+      return (text.includes("条回复") || text === "收起") && text.length <= 20;
+    });
+    const replyCandidate = candidates.find((node) => normalize(node.textContent || "") === "回复");
+    const hasAuthorReply = candidates.some((node) => normalize(node.textContent || "") === "作者");
+
+    if (toggleCandidate instanceof HTMLElement) {
+      toggleCandidate.setAttribute("data-codex-toggle-action", "true");
+    }
+
+    if (replyCandidate instanceof HTMLElement) {
+      replyCandidate.setAttribute("data-codex-reply-action", "true");
+    }
+
+    return {
+      hasToggle: toggleCandidate instanceof HTMLElement,
+      toggleText: normalize(toggleCandidate?.textContent || ""),
+      hasReplyButton: replyCandidate instanceof HTMLElement,
+      hasAuthorReply
+    };
+  });
+}
+
+async function waitForReplySendReady(page, commentLocator, timeoutMs) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const ready = await commentLocator.evaluate((root) => {
+      const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
+      const sendCandidate = Array.from(root.querySelectorAll("button, div, span")).find(
+        (node) => normalize(node.textContent || "") === "发送"
+      );
+
+      if (!(sendCandidate instanceof HTMLElement)) {
+        return false;
+      }
+
+      const style = window.getComputedStyle(sendCandidate);
+      const isButton = sendCandidate instanceof HTMLButtonElement;
+      const disabled =
+        (isButton && sendCandidate.disabled) ||
+        sendCandidate.getAttribute("disabled") !== null ||
+        sendCandidate.getAttribute("aria-disabled") === "true";
+
+      return !disabled && style.pointerEvents !== "none" && style.visibility !== "hidden";
+    });
+
+    if (ready) {
+      return;
+    }
+
+    await page.waitForTimeout(120);
+  }
+
+  throw new Error(`Timed out waiting for the send button after ${timeoutMs}ms.`);
+}
+
+async function safeReplyToComment(page, commentLocator, comment, options) {
+  const result = {
+    username: comment.username,
+    commentText: comment.commentText,
+    publishText: comment.publishText,
+    status: "pending"
+  };
+
+  try {
+    let actionState = await inspectCommentActions(commentLocator);
+
+    if (actionState.hasToggle && actionState.toggleText.includes("条回复")) {
+      const toggleButton = commentLocator.locator('[data-codex-toggle-action="true"]').first();
+      await toggleButton.click();
+      await page.waitForTimeout(Math.min(1000, options.replySettleMs));
+      actionState = await inspectCommentActions(commentLocator);
+    }
+
+    if (actionState.hasAuthorReply) {
+      return {
+        ...result,
+        status: "skipped_already_replied"
+      };
+    }
+
+    if (!actionState.hasReplyButton) {
+      return {
+        ...result,
+        status: "skipped_no_reply_button"
+      };
+    }
+
+    const replyButton = commentLocator.locator('[data-codex-reply-action="true"]').first();
+    await replyButton.click();
+
+    const inputBox = commentLocator.locator('div[contenteditable="true"]').last();
+    await inputBox.waitFor({ state: "visible", timeout: options.replyTimeoutMs });
+    await inputBox.click();
+    await inputBox.type(options.replyMessage, {
+      delay: options.replyTypeDelayMs
+    });
+
+    await waitForReplySendReady(page, commentLocator, options.replyTimeoutMs);
+
+    const sendButton = commentLocator.getByText("发送", { exact: true }).first();
+    await sendButton.click();
+    await page.waitForTimeout(options.replySettleMs);
+
+    return {
+      ...result,
+      status: "replied"
+    };
+  } catch (error) {
+    return {
+      ...result,
+      status: "error",
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+async function replyToComments(page, options) {
+  await waitForCommentsArea(page, options);
+
+  const scrollContainer = await markCommentScrollContainer(page);
+  const startedAt = Date.now();
+  const processedSignatures = new Set();
+  const processedPlanIds = new Set();
+  const results = [];
+  let repliedCount = 0;
+  let lastProgressAt = startedAt;
+
+  while (Date.now() - startedAt < options.timeoutMs) {
+    if (Array.isArray(options.replyPlans) && processedPlanIds.size >= options.replyPlans.length) {
+      break;
+    }
+
+    const snapshot = await extractCommentSnapshot(page);
+    const nextTarget = getNextReplyTarget(
+      snapshot,
+      options,
+      processedSignatures,
+      processedPlanIds
+    );
+
+    if (nextTarget) {
+      const { comment: nextComment, plan, replyMessage } = nextTarget;
+      const commentLocator = page
+        .locator(`[data-codex-comment-block="${nextComment.domIndex}"]`)
+        .first();
+      const replyResult = await safeReplyToComment(page, commentLocator, nextComment, {
+        ...options,
+        replyMessage
+      });
+
+      processedSignatures.add(nextComment.signature);
+      if (plan) {
+        processedPlanIds.add(plan.id);
+      }
+      results.push({
+        ...replyResult,
+        replyPlanId: plan?.id ?? null,
+        requestedReplyMessage: replyMessage
+      });
+      lastProgressAt = Date.now();
+
+      if (replyResult.status === "replied") {
+        repliedCount += 1;
+      }
+
+      if (repliedCount >= options.replyLimit) {
+        break;
+      }
+
+      continue;
+    }
+
+    const scrollState = await scrollContainer.evaluate((element) => {
+      const before = element.scrollTop;
+      const maxScrollTop = Math.max(element.scrollHeight - element.clientHeight, 0);
+      const next = Math.min(before + Math.max(element.clientHeight * 0.9, 900), maxScrollTop);
+      element.scrollTop = next;
+      return {
+        before,
+        after: element.scrollTop,
+        maxScrollTop
+      };
+    });
+
+    await page.waitForTimeout(1200);
+
+    const nextSnapshot = await extractCommentSnapshot(page);
+    const hasUnprocessed = Boolean(
+      getNextReplyTarget(nextSnapshot, options, processedSignatures, processedPlanIds)
+    );
+    const reachedBottom =
+      scrollState.after === scrollState.before || scrollState.after >= scrollState.maxScrollTop;
+
+    if (reachedBottom && !hasUnprocessed) {
+      break;
+    }
+
+    if (hasUnprocessed) {
+      lastProgressAt = Date.now();
+      continue;
+    }
+
+    if (Date.now() - lastProgressAt >= options.idleMs) {
+      break;
+    }
+  }
+
+  const skippedCount = results.filter((item) => item.status.startsWith("skipped_")).length;
+  const errorCount = results.filter((item) => item.status === "error").length;
+  const unmatchedPlans = Array.isArray(options.replyPlans)
+    ? options.replyPlans
+        .filter((plan) => !processedPlanIds.has(plan.id))
+        .map((plan) => ({
+          id: plan.id,
+          username: plan.username,
+          commentText: plan.commentText,
+          publishText: plan.publishText,
+          replyMessage: plan.replyMessage
+        }))
+    : [];
+
+  return {
+    repliedCount,
+    skippedCount,
+    errorCount,
+    totalProcessed: results.length,
+    matchedPlanCount: processedPlanIds.size,
+    unmatchedPlanCount: unmatchedPlans.length,
+    unmatchedPlans,
+    results
+  };
 }
 
 async function collectComments(page, options) {
@@ -1060,20 +1521,9 @@ async function collectComments(page, options) {
     }
 
     const snapshot = await extractCommentSnapshot(page);
-    let additions = 0;
-
-    for (const comment of snapshot) {
-      if (!comment.signature || commentsBySignature.has(comment.signature)) {
-        continue;
-      }
-
-      commentsBySignature.set(comment.signature, comment);
-      additions += 1;
+    const additions = addCommentsFromSnapshot(commentsBySignature, snapshot);
+    if (additions > 0) {
       lastProgressAt = Date.now();
-
-      if (commentsBySignature.size >= options.limit) {
-        break;
-      }
     }
 
     if (commentsBySignature.size >= options.limit) {
@@ -1094,18 +1544,42 @@ async function collectComments(page, options) {
 
     await page.waitForTimeout(1200);
 
-    const idleElapsedMs = Date.now() - lastProgressAt;
-    const reachedBottom =
-      scrollState.after === scrollState.before || scrollState.after >= scrollState.maxScrollTop;
+    const postWaitScrollState = await scrollContainer.evaluate((element) => {
+      return {
+        top: element.scrollTop,
+        maxScrollTop: Math.max(element.scrollHeight - element.clientHeight, 0)
+      };
+    });
 
-    if (reachedBottom && idleElapsedMs >= options.idleMs) {
+    const reachedBottom =
+      scrollState.after === scrollState.before ||
+      postWaitScrollState.top >= postWaitScrollState.maxScrollTop;
+
+    if (reachedBottom) {
+      const finalSnapshot = await extractCommentSnapshot(page);
+      const finalAdditions = addCommentsFromSnapshot(commentsBySignature, finalSnapshot);
+      if (finalAdditions > 0) {
+        lastProgressAt = Date.now();
+      }
+
+      if (commentsBySignature.size >= options.limit) {
+        break;
+      }
+
+      if (finalAdditions === 0) {
+        break;
+      }
+    }
+
+    const idleElapsedMs = Date.now() - lastProgressAt;
+    if (idleElapsedMs >= options.idleMs) {
       break;
     }
   }
 
   return [...commentsBySignature.values()]
     .slice(0, options.limit)
-    .map(({ signature, ...comment }) => comment);
+    .map(({ signature, domIndex, ...comment }) => comment);
 }
 
 async function emitResult(result, outputPath) {
@@ -1129,6 +1603,11 @@ async function main() {
     printHelp();
     return;
   }
+
+  const replyPlans = args.replyPlanFile
+    ? await loadReplyPlan(args.replyPlanFile, args.replyMessage)
+    : [];
+  const isReplyMode = Boolean(args.replyMessage || args.replyPlanFile);
 
   const context = await chromium.launchPersistentContext(args.userDataDir, {
     headless: args.headless,
@@ -1186,6 +1665,36 @@ async function main() {
         timeoutMs: args.worksTimeoutMs,
         uiTimeoutMs: args.uiTimeoutMs
       });
+    }
+
+    if (isReplyMode) {
+      const replySummary = await replyToComments(page, {
+        replyMessage: args.replyMessage,
+        replyPlans,
+        replyPlanMode: Boolean(args.replyPlanFile),
+        replyLimit: args.replyLimit,
+        replyTimeoutMs: args.replyTimeoutMs,
+        replySettleMs: args.replySettleMs,
+        replyTypeDelayMs: args.replyTypeDelayMs,
+        timeoutMs: args.commentsTimeoutMs,
+        idleMs: args.commentsIdleMs,
+        uiTimeoutMs: args.uiTimeoutMs
+      });
+
+      await emitResult(
+        {
+          fetchedAt: new Date().toISOString(),
+          mode: "reply",
+          pageUrl: args.pageUrl,
+          selectedWork: getSelectedWorkOutput(targetWork),
+          replyMessage: args.replyMessage,
+          replyPlanFile: args.replyPlanFile || null,
+          replyLimit: args.replyLimit,
+          ...replySummary
+        },
+        args.output
+      );
+      return;
     }
 
     const comments = await collectComments(page, {
