@@ -91,6 +91,7 @@ npm run comments -- \
 - 按 `--work-id` 或 `--work-title` 抓评论时，脚本会在匹配到目标作品后提前停止滚动，不再遍历完整个作品列表。
 - 作品选择现在优先按标题精确匹配；如果同标题作品无法用发布时间区分，脚本会直接报歧义，建议改用 `--work-id`。
 - 回复模式会先检查当前评论是否已经存在“作者”回复；如果存在则跳过，避免重复回复。
+- 回复模式还会把已成功发送过的“作品 + 评论 + 回复文案”记录到 `.playwright/reply-history.json`，脚本重复执行时会优先跳过这些已发记录。
 - `--reply-plan-file` 支持为每条目标评论单独指定 `replyMessage`；示例格式见 [reply-plan.example.json](/Users/yangguang.wen/douyin_plugin_back/reply-plan.example.json)。
 - `reply-plan-file` 中 `commentText` 必填，`username` 和 `publishText` 选填；填得越全，定向匹配越稳。
 - 其他依赖网络或页面渲染的步骤也已经开放超时参数，包括页面打开、作品侧边栏出现、评论区出现和评论抓取总时长。

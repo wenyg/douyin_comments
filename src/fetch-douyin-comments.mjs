@@ -9,6 +9,7 @@ import { chromium } from "playwright";
 const DEFAULT_COMMENT_PAGE_URL =
   "https://creator.douyin.com/creator-micro/interactive/comment";
 const DEFAULT_USER_DATA_DIR = path.resolve(".playwright/douyin-profile");
+const DEFAULT_REPLY_HISTORY_FILE = path.resolve(".playwright/reply-history.json");
 
 function printHelp() {
   console.log(`
@@ -202,6 +203,128 @@ function formatUnixSeconds(rawValue) {
 
 function normalizeLookupText(value = "") {
   return normalizeText(value).toLowerCase();
+}
+
+function getCommentSignature(comment) {
+  if (comment?.signature) {
+    return comment.signature;
+  }
+
+  return [
+    normalizeText(comment?.username ?? ""),
+    normalizeText(comment?.commentText ?? ""),
+    normalizeText(comment?.publishText ?? "")
+  ].join("|");
+}
+
+function getSelectedWorkIdentity(work) {
+  if (!work) {
+    return "all-works";
+  }
+
+  if (work.itemId) {
+    return `item:${work.itemId}`;
+  }
+
+  return `title:${normalizeLookupText(work.title)}|publish:${normalizeLookupText(work.publishText)}`;
+}
+
+function getReplyHistoryKey(selectedWork, comment, replyMessage) {
+  return [
+    getSelectedWorkIdentity(selectedWork),
+    getCommentSignature(comment),
+    normalizeLookupText(replyMessage)
+  ].join("::");
+}
+
+async function loadReplyHistory(filePath = DEFAULT_REPLY_HISTORY_FILE) {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const entries = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.entries) ? parsed.entries : [];
+    const normalizedEntries = entries
+      .filter((entry) => entry && typeof entry === "object")
+      .map((entry) => ({
+        key: String(entry.key ?? ""),
+        selectedWork: entry.selectedWork ?? null,
+        username: normalizeText(String(entry.username ?? "")),
+        commentText: normalizeText(String(entry.commentText ?? "")),
+        publishText: normalizeText(String(entry.publishText ?? "")),
+        replyMessage: String(entry.replyMessage ?? "").trim(),
+        repliedAt: String(entry.repliedAt ?? "")
+      }))
+      .filter((entry) => entry.key && entry.replyMessage);
+
+    return {
+      filePath,
+      entries: normalizedEntries,
+      keys: new Set(normalizedEntries.map((entry) => entry.key))
+    };
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return {
+        filePath,
+        entries: [],
+        keys: new Set()
+      };
+    }
+
+    throw new Error(
+      `Failed to load reply history from ${filePath}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+async function persistReplyHistory(history) {
+  const payload = JSON.stringify(
+    {
+      updatedAt: new Date().toISOString(),
+      entries: history.entries
+    },
+    null,
+    2
+  );
+
+  await fs.mkdir(path.dirname(history.filePath), { recursive: true });
+  await fs.writeFile(history.filePath, `${payload}\n`, "utf8");
+}
+
+function findReplyHistoryEntry(history, selectedWork, comment, replyMessage) {
+  if (!history) {
+    return null;
+  }
+
+  const key = getReplyHistoryKey(selectedWork, comment, replyMessage);
+  return history.entries.find((entry) => entry.key === key) ?? null;
+}
+
+async function recordReplyHistory(history, selectedWork, comment, replyMessage) {
+  if (!history) {
+    return;
+  }
+
+  const key = getReplyHistoryKey(selectedWork, comment, replyMessage);
+  if (history.keys.has(key)) {
+    return;
+  }
+
+  history.keys.add(key);
+  history.entries.push({
+    key,
+    selectedWork: selectedWork
+      ? {
+          itemId: selectedWork.itemId,
+          title: selectedWork.title,
+          publishText: selectedWork.publishText
+        }
+      : null,
+    username: normalizeText(comment.username ?? ""),
+    commentText: normalizeText(comment.commentText ?? ""),
+    publishText: normalizeText(comment.publishText ?? ""),
+    replyMessage,
+    repliedAt: new Date().toISOString()
+  });
+  await persistReplyHistory(history);
 }
 
 function normalizeReplyPlanEntry(rawEntry, index, fallbackReplyMessage) {
@@ -1269,9 +1392,10 @@ function getNextReplyTarget(snapshot, options, processedSignatures, processedPla
   return null;
 }
 
-async function inspectCommentActions(commentLocator) {
-  return commentLocator.evaluate((root) => {
+async function inspectCommentActions(commentLocator, intendedReplyMessage = "") {
+  return commentLocator.evaluate((root, replyMessage) => {
     const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
+    const normalizedReplyMessage = normalize(replyMessage);
 
     for (const marked of root.querySelectorAll("[data-codex-toggle-action]")) {
       marked.removeAttribute("data-codex-toggle-action");
@@ -1288,6 +1412,10 @@ async function inspectCommentActions(commentLocator) {
     });
     const replyCandidate = candidates.find((node) => normalize(node.textContent || "") === "回复");
     const hasAuthorReply = candidates.some((node) => normalize(node.textContent || "") === "作者");
+    const hasDuplicateReplyMessage =
+      Boolean(normalizedReplyMessage) &&
+      hasAuthorReply &&
+      normalize(root.innerText || "").includes(normalizedReplyMessage);
 
     if (toggleCandidate instanceof HTMLElement) {
       toggleCandidate.setAttribute("data-codex-toggle-action", "true");
@@ -1301,9 +1429,10 @@ async function inspectCommentActions(commentLocator) {
       hasToggle: toggleCandidate instanceof HTMLElement,
       toggleText: normalize(toggleCandidate?.textContent || ""),
       hasReplyButton: replyCandidate instanceof HTMLElement,
-      hasAuthorReply
+      hasAuthorReply,
+      hasDuplicateReplyMessage
     };
-  });
+  }, intendedReplyMessage);
 }
 
 async function waitForReplySendReady(page, commentLocator, timeoutMs) {
@@ -1349,13 +1478,20 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
   };
 
   try {
-    let actionState = await inspectCommentActions(commentLocator);
+    let actionState = await inspectCommentActions(commentLocator, options.replyMessage);
 
     if (actionState.hasToggle && actionState.toggleText.includes("条回复")) {
       const toggleButton = commentLocator.locator('[data-codex-toggle-action="true"]').first();
       await toggleButton.click();
       await page.waitForTimeout(Math.min(1000, options.replySettleMs));
-      actionState = await inspectCommentActions(commentLocator);
+      actionState = await inspectCommentActions(commentLocator, options.replyMessage);
+    }
+
+    if (actionState.hasDuplicateReplyMessage) {
+      return {
+        ...result,
+        status: "skipped_duplicate_reply_message"
+      };
     }
 
     if (actionState.hasAuthorReply) {
@@ -1427,6 +1563,31 @@ async function replyToComments(page, options) {
 
     if (nextTarget) {
       const { comment: nextComment, plan, replyMessage } = nextTarget;
+      const duplicateHistoryEntry = findReplyHistoryEntry(
+        options.replyHistory,
+        options.selectedWork,
+        nextComment,
+        replyMessage
+      );
+
+      if (duplicateHistoryEntry) {
+        processedSignatures.add(nextComment.signature);
+        if (plan) {
+          processedPlanIds.add(plan.id);
+        }
+        results.push({
+          username: nextComment.username,
+          commentText: nextComment.commentText,
+          publishText: nextComment.publishText,
+          status: "skipped_duplicate_history",
+          replyPlanId: plan?.id ?? null,
+          requestedReplyMessage: replyMessage,
+          historyRepliedAt: duplicateHistoryEntry.repliedAt
+        });
+        lastProgressAt = Date.now();
+        continue;
+      }
+
       const commentLocator = page
         .locator(`[data-codex-comment-block="${nextComment.domIndex}"]`)
         .first();
@@ -1448,6 +1609,21 @@ async function replyToComments(page, options) {
 
       if (replyResult.status === "replied") {
         repliedCount += 1;
+        await recordReplyHistory(
+          options.replyHistory,
+          options.selectedWork,
+          nextComment,
+          replyMessage
+        );
+      }
+
+      if (replyResult.status === "skipped_duplicate_reply_message") {
+        await recordReplyHistory(
+          options.replyHistory,
+          options.selectedWork,
+          nextComment,
+          replyMessage
+        );
       }
 
       if (repliedCount >= options.replyLimit) {
@@ -1619,6 +1795,7 @@ async function main() {
     ? await loadReplyPlan(args.replyPlanFile, args.replyMessage)
     : [];
   const isReplyMode = Boolean(args.replyMessage || args.replyPlanFile);
+  const replyHistory = isReplyMode ? await loadReplyHistory() : null;
 
   const context = await chromium.launchPersistentContext(args.userDataDir, {
     headless: args.headless,
@@ -1683,6 +1860,8 @@ async function main() {
         replyMessage: args.replyMessage,
         replyPlans,
         replyPlanMode: Boolean(args.replyPlanFile),
+        replyHistory,
+        selectedWork: targetWork,
         replyLimit: args.replyLimit,
         replyTimeoutMs: args.replyTimeoutMs,
         replySettleMs: args.replySettleMs,
@@ -1700,6 +1879,7 @@ async function main() {
           selectedWork: getSelectedWorkOutput(targetWork),
           replyMessage: args.replyMessage,
           replyPlanFile: args.replyPlanFile || null,
+          replyHistoryFile: replyHistory?.filePath ?? null,
           replyLimit: args.replyLimit,
           ...replySummary
         },
