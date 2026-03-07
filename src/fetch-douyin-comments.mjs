@@ -463,6 +463,86 @@ async function fetchAllWorks(page, workCollector, options) {
   return [];
 }
 
+function getWorkKey(work) {
+  if (work.itemId) {
+    return `id:${work.itemId}`;
+  }
+
+  return `text:${normalizeText(work.title).toLowerCase()}|${normalizeText(work.publishText).toLowerCase()}`;
+}
+
+function mergeWorkRecords(...works) {
+  const availableWorks = works.filter(Boolean);
+  if (availableWorks.length === 0) {
+    return null;
+  }
+
+  const merged = {
+    itemId: "",
+    secItemId: "",
+    title: "",
+    publishText: "",
+    source: "unknown"
+  };
+
+  for (const work of availableWorks) {
+    if (!merged.itemId && work.itemId) {
+      merged.itemId = work.itemId;
+    }
+
+    if (!merged.secItemId && work.secItemId) {
+      merged.secItemId = work.secItemId;
+    }
+
+    if (!merged.title && work.title) {
+      merged.title = work.title;
+    }
+
+    if (!merged.publishText && work.publishText) {
+      merged.publishText = work.publishText;
+    }
+
+    if (merged.source === "unknown" && work.source) {
+      merged.source = work.source;
+    }
+  }
+
+  if (availableWorks.some((work) => work.source === "api")) {
+    merged.source = "api";
+  }
+
+  return merged;
+}
+
+function mergeWorkLists(...lists) {
+  const mergedByKey = new Map();
+
+  for (const list of lists) {
+    for (const work of list) {
+      const key = getWorkKey(work);
+      const existing = mergedByKey.get(key);
+      mergedByKey.set(key, mergeWorkRecords(existing, work));
+    }
+  }
+
+  return [...mergedByKey.values()];
+}
+
+function findExactTargetWork(works, workId, workTitle) {
+  if (workId) {
+    return works.find((work) => work.itemId === workId) ?? null;
+  }
+
+  if (!workTitle) {
+    return null;
+  }
+
+  const normalizedTitle = normalizeText(workTitle).toLowerCase();
+  return (
+    works.find((work) => normalizeText(work.title).toLowerCase() === normalizedTitle) ?? null
+  );
+}
+
 function hasWorkIdentity(work) {
   return Boolean(work.itemId || work.title);
 }
@@ -528,6 +608,80 @@ async function fetchAllWorksWithRetry(page, workCollector, options) {
   }
 }
 
+async function findTargetWork(page, workCollector, options) {
+  const sideSheet = await openWorksSideSheet(page, options);
+  const startedAt = Date.now();
+  let lastProgressAt = startedAt;
+  let previousDomCount = -1;
+  let previousApiCount = -1;
+  let previousResponseCount = -1;
+  let latestDomWorks = [];
+
+  while (Date.now() - startedAt < options.timeoutMs) {
+    latestDomWorks = await extractWorksFromSideSheet(sideSheet);
+    const apiWorks = workCollector.values();
+    const collectorState = workCollector.state();
+    const domCount = latestDomWorks.length;
+    const apiCount = collectorState.count;
+    const responseCount = collectorState.responseCount;
+    const hasSignal = domCount > 0 || responseCount > 0 || apiCount > 0;
+    const changed =
+      domCount !== previousDomCount ||
+      apiCount !== previousApiCount ||
+      responseCount !== previousResponseCount;
+
+    if (changed) {
+      lastProgressAt = Date.now();
+    }
+
+    const exactDomMatch = findExactTargetWork(
+      latestDomWorks,
+      options.workId,
+      options.workTitle
+    );
+    const exactApiMatch = findExactTargetWork(apiWorks, options.workId, options.workTitle);
+    const resolvedMatch = mergeWorkRecords(exactDomMatch, exactApiMatch);
+
+    if (resolvedMatch) {
+      return resolvedMatch;
+    }
+
+    previousDomCount = domCount;
+    previousApiCount = apiCount;
+    previousResponseCount = responseCount;
+
+    if (hasSignal && Date.now() - lastProgressAt >= options.idleMs) {
+      break;
+    }
+
+    await sideSheet.evaluate((element, hasSignalNow) => {
+      if (!hasSignalNow) {
+        element.scrollTop = 0;
+        return;
+      }
+
+      element.scrollTop += Math.max(element.clientHeight * 1.5, 1200);
+    }, hasSignal);
+    await page.waitForTimeout(hasSignal ? 1500 : 800);
+  }
+
+  const fallbackWorks = mergeWorkLists(workCollector.values(), latestDomWorks);
+  return pickTargetWork(fallbackWorks, options.workId, options.workTitle);
+}
+
+async function findTargetWorkWithRetry(page, workCollector, options) {
+  try {
+    return await findTargetWork(page, workCollector, options);
+  } catch (error) {
+    const sideSheet = await openWorksSideSheet(page, options);
+    await sideSheet.evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    await page.waitForTimeout(1000);
+    return findTargetWork(page, workCollector, options);
+  }
+}
+
 function pickTargetWork(works, workId, workTitle) {
   if (workId) {
     const match = works.find((work) => work.itemId === workId);
@@ -571,65 +725,88 @@ function pickTargetWork(works, workId, workTitle) {
 async function selectWorkFromSideSheet(page, targetWork, options) {
   ensureSelectableWork(targetWork);
   const sideSheet = await openWorksSideSheet(page, options);
-  await inspectWorksInSideSheet(sideSheet);
-  await scrollWorkCardIntoView(sideSheet, targetWork.title);
+  const startedAt = Date.now();
 
-  const found = await sideSheet.evaluate((element, work) => {
-    const compact = (value = "") => value.replace(/\s+/g, "");
-    const titleNeedle = compact(work.title);
-    const publishNeedle = compact(work.publishText);
+  while (Date.now() - startedAt < options.timeoutMs) {
+    await inspectWorksInSideSheet(sideSheet);
+    await scrollWorkCardIntoView(sideSheet, targetWork.title);
 
-    for (const child of Array.from(element.querySelectorAll("[data-codex-target-work]"))) {
-      if (child instanceof HTMLElement) {
-        child.removeAttribute("data-codex-target-work");
+    const found = await sideSheet.evaluate((element, work) => {
+      const compact = (value = "") => value.replace(/\s+/g, "");
+      const titleNeedle = compact(work.title);
+      const publishNeedle = compact(work.publishText);
+
+      for (const child of Array.from(element.querySelectorAll("[data-codex-target-work]"))) {
+        if (child instanceof HTMLElement) {
+          child.removeAttribute("data-codex-target-work");
+        }
       }
+
+      const cards = Array.from(element.querySelectorAll("[data-codex-work-card]"));
+
+      for (const child of cards) {
+        if (!(child instanceof HTMLElement)) {
+          continue;
+        }
+
+        const text = compact(child.innerText || "");
+        if (!text.includes(titleNeedle)) {
+          continue;
+        }
+
+        if (publishNeedle && !text.includes(publishNeedle)) {
+          continue;
+        }
+
+        child.setAttribute("data-codex-target-work", "true");
+        return true;
+      }
+
+      for (const child of cards) {
+        if (!(child instanceof HTMLElement)) {
+          continue;
+        }
+
+        const text = compact(child.innerText || "");
+        if (!text.includes(titleNeedle)) {
+          continue;
+        }
+
+        child.setAttribute("data-codex-target-work", "true");
+        return true;
+      }
+
+      return false;
+    }, targetWork);
+
+    if (found) {
+      const workCard = sideSheet.locator('[data-codex-target-work="true"]').first();
+      await workCard.scrollIntoViewIfNeeded();
+      await workCard.click();
+      await page.waitForTimeout(1800);
+      return;
     }
 
-    const cards = Array.from(element.querySelectorAll("[data-codex-work-card]"));
+    const scrollState = await sideSheet.evaluate((element) => {
+      const before = element.scrollTop;
+      const maxScrollTop = Math.max(element.scrollHeight - element.clientHeight, 0);
+      const next = Math.min(before + Math.max(element.clientHeight * 0.9, 900), maxScrollTop);
+      element.scrollTop = next;
+      return {
+        before,
+        after: element.scrollTop,
+        maxScrollTop
+      };
+    });
 
-    for (const child of cards) {
-      if (!(child instanceof HTMLElement)) {
-        continue;
-      }
-
-      const text = compact(child.innerText || "");
-      if (!text.includes(titleNeedle)) {
-        continue;
-      }
-
-      if (publishNeedle && !text.includes(publishNeedle)) {
-        continue;
-      }
-
-      child.setAttribute("data-codex-target-work", "true");
-      return true;
+    if (scrollState.after === scrollState.before || scrollState.after >= scrollState.maxScrollTop) {
+      break;
     }
 
-    for (const child of cards) {
-      if (!(child instanceof HTMLElement)) {
-        continue;
-      }
-
-      const text = compact(child.innerText || "");
-      if (!text.includes(titleNeedle)) {
-        continue;
-      }
-
-      child.setAttribute("data-codex-target-work", "true");
-      return true;
-    }
-
-    return false;
-  }, targetWork);
-
-  if (!found) {
-    throw new Error(`Failed to find the target work card in the side sheet: ${targetWork.title}`);
+    await page.waitForTimeout(800);
   }
 
-  const workCard = sideSheet.locator('[data-codex-target-work="true"]').first();
-  await workCard.scrollIntoViewIfNeeded();
-  await workCard.click();
-  await page.waitForTimeout(1800);
+  throw new Error(`Failed to find the target work card in the side sheet: ${targetWork.title}`);
 }
 
 async function waitForCommentsArea(page, options) {
@@ -971,10 +1148,10 @@ async function main() {
       uiTimeoutMs: args.uiTimeoutMs
     });
 
-    const needsWorks = args.listWorks || Boolean(args.workId || args.workTitle);
     let works = [];
+    let targetWork = null;
 
-    if (needsWorks) {
+    if (args.listWorks) {
       works = await fetchAllWorksWithRetry(page, workCollector, {
         timeoutMs: args.worksTimeoutMs,
         idleMs: args.worksIdleMs,
@@ -994,9 +1171,19 @@ async function main() {
       return;
     }
 
-    const targetWork = pickTargetWork(works, args.workId, args.workTitle);
+    if (args.workId || args.workTitle) {
+      targetWork = await findTargetWorkWithRetry(page, workCollector, {
+        workId: args.workId,
+        workTitle: args.workTitle,
+        timeoutMs: args.worksTimeoutMs,
+        idleMs: args.worksIdleMs,
+        uiTimeoutMs: args.uiTimeoutMs
+      });
+    }
+
     if (targetWork) {
       await selectWorkFromSideSheet(page, targetWork, {
+        timeoutMs: args.worksTimeoutMs,
         uiTimeoutMs: args.uiTimeoutMs
       });
     }
