@@ -20,7 +20,12 @@ Options:
   --work-id <item_id>       Select a work by item_id
   --work-title <title>      Select a work by title
   --limit <n>               Max number of comments to collect (default: 200)
+  --navigation-timeout-ms <ms>  Max wait for page navigation (default: 60000)
+  --ui-timeout-ms <ms>      Max wait for key page elements to appear (default: 30000)
   --works-timeout-ms <ms>   Max wait for the works list to appear (default: 45000)
+  --works-idle-ms <ms>      Works list idle window before stopping (default: 5000)
+  --comments-timeout-ms <ms> Max wait for comment collection (default: 90000)
+  --comments-idle-ms <ms>   Comment idle window before stopping (default: 5000)
   --output <path>           Write JSON result to a file
   --headless                Run Chromium in headless mode
   --user-data-dir <path>    Playwright persistent profile path
@@ -51,7 +56,12 @@ function parseArgs(argv) {
     workTitle: "",
     listWorks: false,
     limit: 200,
+    navigationTimeoutMs: 60000,
+    uiTimeoutMs: 30000,
     worksTimeoutMs: 45000,
+    worksIdleMs: 5000,
+    commentsTimeoutMs: 90000,
+    commentsIdleMs: 5000,
     headless: false,
     expandReplies: false
   };
@@ -78,8 +88,34 @@ function parseArgs(argv) {
         args.limit = toPositiveInteger(argv[index + 1], "--limit");
         index += 1;
         break;
+      case "--navigation-timeout-ms":
+        args.navigationTimeoutMs = toPositiveInteger(
+          argv[index + 1],
+          "--navigation-timeout-ms"
+        );
+        index += 1;
+        break;
+      case "--ui-timeout-ms":
+        args.uiTimeoutMs = toPositiveInteger(argv[index + 1], "--ui-timeout-ms");
+        index += 1;
+        break;
       case "--works-timeout-ms":
         args.worksTimeoutMs = toPositiveInteger(argv[index + 1], "--works-timeout-ms");
+        index += 1;
+        break;
+      case "--works-idle-ms":
+        args.worksIdleMs = toPositiveInteger(argv[index + 1], "--works-idle-ms");
+        index += 1;
+        break;
+      case "--comments-timeout-ms":
+        args.commentsTimeoutMs = toPositiveInteger(
+          argv[index + 1],
+          "--comments-timeout-ms"
+        );
+        index += 1;
+        break;
+      case "--comments-idle-ms":
+        args.commentsIdleMs = toPositiveInteger(argv[index + 1], "--comments-idle-ms");
         index += 1;
         break;
       case "--output":
@@ -235,26 +271,32 @@ async function promptForEnter(message) {
   }
 }
 
-async function ensureCommentPageReady(page, pageUrl) {
-  await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
+async function ensureCommentPageReady(page, pageUrl, options) {
+  await page.goto(pageUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: options.navigationTimeoutMs
+  });
 
   const selectWorkButton = page
     .locator('button:has-text("选择作品"), [role="button"]:has-text("选择作品")')
     .first();
 
   try {
-    await selectWorkButton.waitFor({ state: "visible", timeout: 15000 });
+    await selectWorkButton.waitFor({ state: "visible", timeout: options.uiTimeoutMs });
     return;
   } catch (error) {
     console.log("未检测到创作者评论页入口，请先在浏览器中完成登录。");
   }
 
   await promptForEnter("完成登录并进入创作者中心评论页后，按 Enter 继续");
-  await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
-  await selectWorkButton.waitFor({ state: "visible", timeout: 30000 });
+  await page.goto(pageUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: options.navigationTimeoutMs
+  });
+  await selectWorkButton.waitFor({ state: "visible", timeout: options.uiTimeoutMs });
 }
 
-async function openWorksSideSheet(page) {
+async function openWorksSideSheet(page, options) {
   const sideSheet = page.locator(".douyin-creator-interactive-sidesheet-body").first();
 
   if (await sideSheet.isVisible().catch(() => false)) {
@@ -266,7 +308,7 @@ async function openWorksSideSheet(page) {
     .first();
 
   await trigger.click();
-  await sideSheet.waitFor({ state: "visible", timeout: 10000 });
+  await sideSheet.waitFor({ state: "visible", timeout: options.uiTimeoutMs });
   return sideSheet;
 }
 
@@ -358,7 +400,7 @@ async function extractWorksFromSideSheet(sideSheet) {
 }
 
 async function fetchAllWorks(page, workCollector, options) {
-  const sideSheet = await openWorksSideSheet(page);
+  const sideSheet = await openWorksSideSheet(page, options);
   const startedAt = Date.now();
   let lastProgressAt = startedAt;
   let previousDomCount = -1;
@@ -382,7 +424,7 @@ async function fetchAllWorks(page, workCollector, options) {
       lastProgressAt = Date.now();
     }
 
-    if (hasSignal && Date.now() - lastProgressAt >= 5000) {
+    if (hasSignal && Date.now() - lastProgressAt >= options.idleMs) {
       break;
     }
 
@@ -477,7 +519,7 @@ async function fetchAllWorksWithRetry(page, workCollector, options) {
   try {
     return await fetchAllWorks(page, workCollector, options);
   } catch (error) {
-    const sideSheet = await openWorksSideSheet(page);
+    const sideSheet = await openWorksSideSheet(page, options);
     await sideSheet.evaluate((element) => {
       element.scrollTop = 0;
     });
@@ -526,9 +568,9 @@ function pickTargetWork(works, workId, workTitle) {
   throw new Error(`No work matched title: ${workTitle}`);
 }
 
-async function selectWorkFromSideSheet(page, targetWork) {
+async function selectWorkFromSideSheet(page, targetWork, options) {
   ensureSelectableWork(targetWork);
-  const sideSheet = await openWorksSideSheet(page);
+  const sideSheet = await openWorksSideSheet(page, options);
   await inspectWorksInSideSheet(sideSheet);
   await scrollWorkCardIntoView(sideSheet, targetWork.title);
 
@@ -590,7 +632,7 @@ async function selectWorkFromSideSheet(page, targetWork) {
   await page.waitForTimeout(1800);
 }
 
-async function waitForCommentsArea(page) {
+async function waitForCommentsArea(page, options) {
   const candidates = [
     page.locator('[comment-item]').first(),
     page.locator('button:has-text("回复"), div:has-text("回复")').first()
@@ -598,12 +640,16 @@ async function waitForCommentsArea(page) {
 
   for (const locator of candidates) {
     try {
-      await locator.waitFor({ state: "visible", timeout: 8000 });
+      await locator.waitFor({ state: "visible", timeout: options.uiTimeoutMs });
       return;
     } catch (error) {
       // Ignore and try the next locator.
     }
   }
+
+  throw new Error(
+    `Timed out waiting for the comment area after ${options.uiTimeoutMs}ms. Try --ui-timeout-ms 60000.`
+  );
 }
 
 async function markCommentScrollContainer(page) {
@@ -824,13 +870,14 @@ async function extractCommentSnapshot(page) {
 }
 
 async function collectComments(page, options) {
-  await waitForCommentsArea(page);
+  await waitForCommentsArea(page, options);
 
   const scrollContainer = await markCommentScrollContainer(page);
   const commentsBySignature = new Map();
-  let stableRounds = 0;
+  const startedAt = Date.now();
+  let lastProgressAt = startedAt;
 
-  for (let round = 0; round < 60; round += 1) {
+  while (Date.now() - startedAt < options.timeoutMs) {
     if (options.expandReplies) {
       await expandReplyThreads(page);
     }
@@ -845,6 +892,7 @@ async function collectComments(page, options) {
 
       commentsBySignature.set(comment.signature, comment);
       additions += 1;
+      lastProgressAt = Date.now();
 
       if (commentsBySignature.size >= options.limit) {
         break;
@@ -869,17 +917,11 @@ async function collectComments(page, options) {
 
     await page.waitForTimeout(1200);
 
-    if (additions === 0) {
-      stableRounds += 1;
-    } else {
-      stableRounds = 0;
-    }
+    const idleElapsedMs = Date.now() - lastProgressAt;
+    const reachedBottom =
+      scrollState.after === scrollState.before || scrollState.after >= scrollState.maxScrollTop;
 
-    if (scrollState.after === scrollState.before || scrollState.after >= scrollState.maxScrollTop) {
-      stableRounds += 1;
-    }
-
-    if (stableRounds >= 3) {
+    if (reachedBottom && idleElapsedMs >= options.idleMs) {
       break;
     }
   }
@@ -917,17 +959,26 @@ async function main() {
   });
 
   const page = context.pages()[0] ?? (await context.newPage());
+  context.setDefaultTimeout(args.uiTimeoutMs);
+  context.setDefaultNavigationTimeout(args.navigationTimeoutMs);
+  page.setDefaultTimeout(args.uiTimeoutMs);
+  page.setDefaultNavigationTimeout(args.navigationTimeoutMs);
   const workCollector = createWorkCollector(page);
 
   try {
-    await ensureCommentPageReady(page, args.pageUrl);
+    await ensureCommentPageReady(page, args.pageUrl, {
+      navigationTimeoutMs: args.navigationTimeoutMs,
+      uiTimeoutMs: args.uiTimeoutMs
+    });
 
     const needsWorks = args.listWorks || Boolean(args.workId || args.workTitle);
     let works = [];
 
     if (needsWorks) {
       works = await fetchAllWorksWithRetry(page, workCollector, {
-        timeoutMs: args.worksTimeoutMs
+        timeoutMs: args.worksTimeoutMs,
+        idleMs: args.worksIdleMs,
+        uiTimeoutMs: args.uiTimeoutMs
       });
     }
 
@@ -945,12 +996,17 @@ async function main() {
 
     const targetWork = pickTargetWork(works, args.workId, args.workTitle);
     if (targetWork) {
-      await selectWorkFromSideSheet(page, targetWork);
+      await selectWorkFromSideSheet(page, targetWork, {
+        uiTimeoutMs: args.uiTimeoutMs
+      });
     }
 
     const comments = await collectComments(page, {
       limit: args.limit,
-      expandReplies: args.expandReplies
+      expandReplies: args.expandReplies,
+      timeoutMs: args.commentsTimeoutMs,
+      idleMs: args.commentsIdleMs,
+      uiTimeoutMs: args.uiTimeoutMs
     });
 
     await emitResult(
