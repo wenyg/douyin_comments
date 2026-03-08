@@ -282,8 +282,12 @@ function mergeReplyArrays(existingReplies = [], incomingReplies = []) {
 }
 
 function sanitizeCollectedReply(reply) {
-  const { signature, order, ...rest } = reply;
-  return rest;
+  const { signature, order, replyTo = null, ...rest } = reply;
+  return {
+    ...rest,
+    replyTo,
+    reply_to: replyTo
+  };
 }
 
 function sanitizeCollectedComment(comment) {
@@ -293,10 +297,12 @@ function sanitizeCollectedComment(comment) {
         .sort((left, right) => (left.order ?? 0) - (right.order ?? 0))
         .map(sanitizeCollectedReply)
     : [];
-  const { signature, domIndex, order, ...rest } = comment;
+  const { signature, domIndex, order, replyTo = null, ...rest } = comment;
 
   return {
     ...rest,
+    replyTo,
+    reply_to: replyTo,
     collectedReplyCount: replies.length,
     replies
   };
@@ -1291,6 +1297,11 @@ async function extractCommentSnapshot(page) {
       };
     };
 
+    const extractReplyTarget = (value = "") => {
+      const match = normalize(value).match(/^回复\s*([^:：]+)\s*[:：]/);
+      return normalize(match?.[1] || "");
+    };
+
     const isNoiseLine = (line) => controlPattern.test(line) || pureNumberPattern.test(line);
 
     const parseStructuredEntry = (rawLines, order) => {
@@ -1355,6 +1366,7 @@ async function extractCommentSnapshot(page) {
       return {
         username,
         commentText,
+        replyTo: extractReplyTarget(commentText) || null,
         publishText,
         hasAuthorBadge,
         extraLines,
@@ -1386,6 +1398,7 @@ async function extractCommentSnapshot(page) {
         replies.push({
           username: replyEntry.username,
           commentText: replyEntry.commentText,
+          replyTo: replyEntry.replyTo ?? null,
           publishText: replyEntry.publishText,
           hasAuthorBadge: replyEntry.hasAuthorBadge,
           extraLines: replyEntry.extraLines,
@@ -1452,6 +1465,14 @@ async function extractCommentSnapshot(page) {
 
       const usernameLine = normalizeNameLine(usernameText);
       const publishText = normalize(timeNode?.innerText || "");
+      const replyTo =
+        normalize(commentNode?.querySelector(".reply-to-lFblpf .name-IHGGka")?.textContent || "") ||
+        normalize(commentNode?.querySelector(".reply-to-lFblpf")?.textContent || "")
+          .replace(/^回复/, "")
+          .replace(/[:：]\s*$/, "")
+          .trim() ||
+        extractReplyTarget(commentText) ||
+        null;
       const replyThreadTexts = Array.from(block.querySelectorAll(".load-more-pDyh1o"))
         .map((node) => normalize(node.textContent || ""))
         .filter(Boolean);
@@ -1466,6 +1487,7 @@ async function extractCommentSnapshot(page) {
         entry: {
           username: usernameLine.username,
           commentText,
+          replyTo,
           publishText,
           hasAuthorBadge:
             usernameLine.hasAuthorBadge ||
@@ -1583,6 +1605,7 @@ async function extractCommentSnapshot(page) {
         replies.push({
           username: replyEntry.username,
           commentText: replyEntry.commentText,
+          replyTo: replyEntry.replyTo ?? null,
           publishText: replyEntry.publishText,
           hasAuthorBadge: replyEntry.hasAuthorBadge,
           extraLines: replyEntry.extraLines,
@@ -1793,6 +1816,7 @@ async function extractCommentSnapshot(page) {
         domIndex: currentMainComment.domIndex,
         username: currentMainComment.username,
         commentText: currentMainComment.commentText,
+        replyTo: currentMainComment.replyTo ?? null,
         publishText: currentMainComment.publishText,
         replyCount: Math.max(currentMainComment.replyCount, replies.length),
         hasAuthorReply: replies.some((reply) => reply.hasAuthorBadge),
@@ -1821,6 +1845,7 @@ async function extractCommentSnapshot(page) {
           domIndex: block.domIndex,
           username: entry.username,
           commentText: entry.commentText,
+          replyTo: entry.replyTo ?? null,
           publishText: entry.publishText,
           replyCount: block.replyCount,
           extraLines: entry.extraLines,
@@ -1836,6 +1861,7 @@ async function extractCommentSnapshot(page) {
       currentMainComment.replies.push({
         username: entry.username,
         commentText: entry.commentText,
+        replyTo: entry.replyTo ?? null,
         publishText: entry.publishText,
         hasAuthorBadge: entry.hasAuthorBadge,
         extraLines: entry.extraLines,
