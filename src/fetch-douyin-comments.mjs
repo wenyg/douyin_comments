@@ -37,7 +37,8 @@ Options:
   --headless                Run Chromium in headless mode
   --user-data-dir <path>    Playwright persistent profile path
   --page-url <url>          Override the creator comment page URL
-  --expand-replies          Best-effort expansion of "条回复" blocks before scraping
+  --expand-replies          Expand nested replies before scraping (default behavior)
+  --no-expand-replies       Disable nested reply expansion during scraping
   --help                    Print this help
   `);
 }
@@ -76,7 +77,7 @@ function parseArgs(argv) {
     commentsTimeoutMs: 90000,
     commentsIdleMs: 5000,
     headless: false,
-    expandReplies: false
+    expandReplies: true
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -165,6 +166,9 @@ function parseArgs(argv) {
       case "--expand-replies":
         args.expandReplies = true;
         break;
+      case "--no-expand-replies":
+        args.expandReplies = false;
+        break;
       case "--user-data-dir":
         args.userDataDir = path.resolve(argv[index + 1] ?? "");
         index += 1;
@@ -215,6 +219,87 @@ function getCommentSignature(comment) {
     normalizeText(comment?.commentText ?? ""),
     normalizeText(comment?.publishText ?? "")
   ].join("|");
+}
+
+function mergeReplyArrays(existingReplies = [], incomingReplies = []) {
+  const repliesBySignature = new Map();
+
+  for (const reply of existingReplies) {
+    const signature = getCommentSignature(reply);
+    if (!signature) {
+      continue;
+    }
+
+    repliesBySignature.set(signature, reply);
+  }
+
+  let additions = 0;
+  for (const reply of incomingReplies) {
+    const signature = getCommentSignature(reply);
+    if (!signature) {
+      continue;
+    }
+
+    const existingReply = repliesBySignature.get(signature);
+    if (!existingReply) {
+      repliesBySignature.set(signature, reply);
+      additions += 1;
+      continue;
+    }
+
+    repliesBySignature.set(signature, {
+      ...existingReply,
+      ...reply,
+      publishText:
+        reply.publishText && reply.publishText.length >= (existingReply.publishText ?? "").length
+          ? reply.publishText
+          : existingReply.publishText,
+      extraLines:
+        Array.isArray(reply.extraLines) &&
+        reply.extraLines.length >= (existingReply.extraLines?.length ?? 0)
+          ? reply.extraLines
+          : existingReply.extraLines,
+      rawText:
+        (reply.rawText ?? "").length >= (existingReply.rawText ?? "").length
+          ? reply.rawText
+          : existingReply.rawText,
+      hasAuthorBadge: Boolean(existingReply.hasAuthorBadge || reply.hasAuthorBadge),
+      order:
+        typeof existingReply.order === "number" && typeof reply.order === "number"
+          ? Math.min(existingReply.order, reply.order)
+          : typeof existingReply.order === "number"
+            ? existingReply.order
+            : reply.order
+    });
+  }
+
+  return {
+    replies: [...repliesBySignature.values()].sort(
+      (left, right) => (left.order ?? 0) - (right.order ?? 0)
+    ),
+    additions
+  };
+}
+
+function sanitizeCollectedReply(reply) {
+  const { signature, order, ...rest } = reply;
+  return rest;
+}
+
+function sanitizeCollectedComment(comment) {
+  const replies = Array.isArray(comment.replies)
+    ? comment.replies
+        .slice()
+        .sort((left, right) => (left.order ?? 0) - (right.order ?? 0))
+        .map(sanitizeCollectedReply)
+    : [];
+  const { signature, domIndex, order, ...rest } = comment;
+
+  return {
+    ...rest,
+    collectedReplyCount: replies.length,
+    replies
+  };
 }
 
 function getSelectedWorkIdentity(work) {
@@ -1140,12 +1225,14 @@ async function markCommentScrollContainer(page) {
 
 async function expandReplyThreads(page) {
   const expanded = await page.evaluate(() => {
-    const toggles = Array.from(document.querySelectorAll("button, div"))
+    const root =
+      document.querySelector('[data-codex-comment-scroll="true"]') || document.body;
+    const toggles = Array.from(root.querySelectorAll("button, div, span"))
       .filter((node) => {
-        const text = (node.textContent || "").trim();
+        const text = (node.textContent || "").replace(/\s+/g, " ").trim();
         return text.includes("条回复") && text.length <= 20;
       })
-      .slice(0, 12);
+      .slice(0, 20);
 
     let count = 0;
     for (const toggle of toggles) {
@@ -1161,7 +1248,7 @@ async function expandReplyThreads(page) {
   });
 
   if (expanded > 0) {
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(1500);
   }
 }
 
@@ -1172,15 +1259,366 @@ async function extractCommentSnapshot(page) {
 
     const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
     const metaPattern =
-      /(分钟前|小时前|天前|昨天|前天|刚刚|IP属地|发布于|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}|赞|条回复|收起)/;
+      /(分钟前|小时前|天前|昨天|前天|刚刚|IP属地|发布于|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}|赞)/;
+    const replyThreadPattern = /(条回复|收起)/;
     const controlPattern = /^(回复|发送|收起)$/;
     const pureNumberPattern = /^\d+$/;
+    const avatarSelector = 'img, [class*="avatar"], [class*="Avatar"]';
+    const xBandTolerance = 12;
+    const replyIndentMinDelta = 16;
+
+    const splitLines = (value = "") =>
+      value
+        .split(/\n+/)
+        .map((line) => normalize(line))
+        .filter(Boolean);
+
+    const normalizeNameLine = (value = "") => {
+      let username = normalize(value);
+      let hasAuthorBadge = false;
+
+      if (username.endsWith(" 作者")) {
+        username = normalize(username.slice(0, -3));
+        hasAuthorBadge = true;
+      } else if (username.endsWith("作者") && username.length > 2) {
+        username = normalize(username.slice(0, -2));
+        hasAuthorBadge = true;
+      }
+
+      return {
+        username,
+        hasAuthorBadge
+      };
+    };
+
+    const isNoiseLine = (line) => controlPattern.test(line) || pureNumberPattern.test(line);
+
+    const parseStructuredEntry = (rawLines, order) => {
+      const lines = rawLines.filter((line) => !isNoiseLine(line));
+      if (lines.length < 2) {
+        return null;
+      }
+
+      let cursor = 0;
+      const usernameLine = normalizeNameLine(lines[cursor]);
+      let username = usernameLine.username;
+      let hasAuthorBadge = usernameLine.hasAuthorBadge;
+      cursor += 1;
+
+      while (cursor < lines.length && lines[cursor] === "作者") {
+        hasAuthorBadge = true;
+        cursor += 1;
+      }
+
+      if (!username && cursor < lines.length) {
+        const fallbackNameLine = normalizeNameLine(lines[cursor]);
+        username = fallbackNameLine.username;
+        hasAuthorBadge = hasAuthorBadge || fallbackNameLine.hasAuthorBadge;
+        cursor += 1;
+      }
+
+      const commentSegments = [];
+      while (cursor < lines.length) {
+        const line = lines[cursor];
+        if (line === "作者") {
+          hasAuthorBadge = true;
+          cursor += 1;
+          continue;
+        }
+
+        if (replyThreadPattern.test(line)) {
+          break;
+        }
+
+        if (!metaPattern.test(line)) {
+          commentSegments.push(line);
+        }
+        cursor += 1;
+      }
+
+      const commentText = normalize(commentSegments.join(" "));
+      if (!username || !commentText) {
+        return null;
+      }
+
+      const consumedLineCount = cursor;
+      const publishText = normalize(
+        lines
+          .slice(1, consumedLineCount)
+          .filter((line) => line !== "作者" && metaPattern.test(line))
+          .join(" ")
+      );
+      const extraLines = lines
+        .slice(consumedLineCount)
+        .filter((line) => line !== "作者" && !replyThreadPattern.test(line));
+
+      return {
+        username,
+        commentText,
+        publishText,
+        hasAuthorBadge,
+        extraLines,
+        consumedLineCount,
+        order,
+        signature: [username, commentText, publishText].map(normalize).join("|")
+      };
+    };
+
+    const parseRepliesFromLines = (rawLines, mainEntry) => {
+      if (!mainEntry) {
+        return [];
+      }
+
+      const remainingLines = rawLines
+        .filter((line) => !isNoiseLine(line))
+        .slice(mainEntry.consumedLineCount)
+        .filter((line) => !replyThreadPattern.test(line));
+      const replies = [];
+      let cursor = 0;
+
+      while (cursor < remainingLines.length) {
+        const replyEntry = parseStructuredEntry(remainingLines.slice(cursor), replies.length);
+        if (!replyEntry) {
+          cursor += 1;
+          continue;
+        }
+
+        replies.push({
+          username: replyEntry.username,
+          commentText: replyEntry.commentText,
+          publishText: replyEntry.publishText,
+          hasAuthorBadge: replyEntry.hasAuthorBadge,
+          extraLines: replyEntry.extraLines,
+          rawText: normalize(
+            [
+              replyEntry.username,
+              replyEntry.commentText,
+              replyEntry.publishText,
+              ...replyEntry.extraLines
+            ]
+              .filter(Boolean)
+              .join(" ")
+          ),
+          signature: replyEntry.signature,
+          order: replies.length
+        });
+
+        cursor += Math.max(replyEntry.consumedLineCount, 1);
+      }
+
+      return replies;
+    };
+
+    const extractStructuredEntryFromBlock = (block, order) => {
+      if (!(block instanceof HTMLElement)) {
+        return null;
+      }
+
+      const contentNode = Array.from(block.children).find(
+        (child) =>
+          child instanceof HTMLElement && child.classList.contains("content-FM0UMi")
+      );
+      if (!(contentNode instanceof HTMLElement)) {
+        return null;
+      }
+
+      const contentHost =
+        Array.from(contentNode.children).find((child) => child instanceof HTMLElement) ||
+        contentNode;
+      if (!(contentHost instanceof HTMLElement)) {
+        return null;
+      }
+
+      const directChildren = Array.from(contentHost.children).filter(
+        (child) => child instanceof HTMLElement
+      );
+      const usernameNode = directChildren.find((child) =>
+        child.classList.contains("username-aLgaNB")
+      );
+      const timeNode = directChildren.find((child) =>
+        child.classList.contains("time-NRtTXO")
+      );
+      const commentNode = directChildren.find((child) =>
+        child.classList.contains("comment-content-text-JvmAKq")
+      );
+
+      const usernameText = normalize(usernameNode?.innerText || "");
+      const commentText = normalize(commentNode?.innerText || "") || (
+        commentNode?.querySelector("img") ? "[image]" : ""
+      );
+      if (!usernameText || !commentText) {
+        return null;
+      }
+
+      const usernameLine = normalizeNameLine(usernameText);
+      const publishText = normalize(timeNode?.innerText || "");
+      const replyThreadTexts = Array.from(block.querySelectorAll(".load-more-pDyh1o"))
+        .map((node) => normalize(node.textContent || ""))
+        .filter(Boolean);
+      const replyCount = Math.max(
+        0,
+        ...replyThreadTexts.map((text) =>
+          Number.parseInt(text.match(/\d+/)?.[0] ?? "0", 10) || 0
+        )
+      );
+
+      return {
+        entry: {
+          username: usernameLine.username,
+          commentText,
+          publishText,
+          hasAuthorBadge:
+            usernameLine.hasAuthorBadge ||
+            Boolean(usernameNode?.querySelector(".tag-DAEcKE")),
+          extraLines: [],
+          consumedLineCount: 0,
+          order,
+          signature: [usernameLine.username, commentText, publishText]
+            .map(normalize)
+            .join("|")
+        },
+        replyCount,
+        rawText: normalize([usernameText, publishText, commentText].filter(Boolean).join(" ")),
+        inlineReplies: []
+      };
+    };
+
+    const dedupeReplies = (replies = []) => {
+      const repliesBySignature = new Map();
+
+      for (const reply of replies) {
+        if (!reply?.signature) {
+          continue;
+        }
+
+        const existingReply = repliesBySignature.get(reply.signature);
+        if (!existingReply) {
+          repliesBySignature.set(reply.signature, reply);
+          continue;
+        }
+
+        repliesBySignature.set(reply.signature, {
+          ...existingReply,
+          ...reply,
+          publishText:
+            reply.publishText && reply.publishText.length >= (existingReply.publishText || "").length
+              ? reply.publishText
+              : existingReply.publishText,
+          extraLines:
+            Array.isArray(reply.extraLines) &&
+            reply.extraLines.length >= (existingReply.extraLines?.length || 0)
+              ? reply.extraLines
+              : existingReply.extraLines,
+          rawText:
+            (reply.rawText || "").length >= (existingReply.rawText || "").length
+              ? reply.rawText
+              : existingReply.rawText,
+          hasAuthorBadge: Boolean(existingReply.hasAuthorBadge || reply.hasAuthorBadge),
+          order:
+            typeof existingReply.order === "number" && typeof reply.order === "number"
+              ? Math.min(existingReply.order, reply.order)
+              : typeof existingReply.order === "number"
+                ? existingReply.order
+                : reply.order
+        });
+      }
+
+      return [...repliesBySignature.values()].sort(
+        (left, right) => (left.order ?? 0) - (right.order ?? 0)
+      );
+    };
+
+    const parseRepliesFromNodes = (block, mainEntry) => {
+      if (!(block instanceof HTMLElement) || !mainEntry) {
+        return [];
+      }
+
+      const candidateNodes = Array.from(block.querySelectorAll("div, li, article, section")).filter(
+        (node) => {
+          if (!(node instanceof HTMLElement) || node === block) {
+            return false;
+          }
+
+          const text = normalize(node.innerText || "");
+          if (!text || text.length > 900) {
+            return false;
+          }
+
+          const avatarCount = node.querySelectorAll(avatarSelector).length;
+          if (avatarCount !== 1) {
+            return false;
+          }
+
+          const meaningfulLines = splitLines(text).filter((line) => !isNoiseLine(line));
+          if (meaningfulLines.length < 2) {
+            return false;
+          }
+
+          const replyButtonCount = Array.from(node.querySelectorAll("button, div, span")).filter(
+            (child) => normalize(child.textContent || "") === "回复"
+          ).length;
+
+          return replyButtonCount >= 1 && replyButtonCount <= 2;
+        }
+      );
+
+      const leafNodes = candidateNodes.filter(
+        (node) => !candidateNodes.some((other) => other !== node && node.contains(other))
+      );
+      const replies = [];
+      const seen = new Set();
+      const mainSignature = mainEntry.signature;
+
+      for (const [index, node] of leafNodes.entries()) {
+        const replyEntry = parseStructuredEntry(splitLines(node.innerText || ""), index);
+        if (!replyEntry || !replyEntry.signature || replyEntry.signature === mainSignature) {
+          continue;
+        }
+
+        if (seen.has(replyEntry.signature)) {
+          continue;
+        }
+
+        seen.add(replyEntry.signature);
+        replies.push({
+          username: replyEntry.username,
+          commentText: replyEntry.commentText,
+          publishText: replyEntry.publishText,
+          hasAuthorBadge: replyEntry.hasAuthorBadge,
+          extraLines: replyEntry.extraLines,
+          rawText: normalize(node.innerText || ""),
+          signature: replyEntry.signature,
+          order: index
+        });
+      }
+
+      return replies;
+    };
 
     for (const marked of root.querySelectorAll("[data-codex-comment-block]")) {
       marked.removeAttribute("data-codex-comment-block");
     }
 
     const collectBlocks = () => {
+      const classBlocks = Array.from(root.querySelectorAll("div.container-sXKyMs")).filter(
+        (node) => {
+          if (!(node instanceof HTMLElement)) {
+            return false;
+          }
+
+          const text = normalize(node.innerText || "");
+          if (!text || !text.includes("回复")) {
+            return false;
+          }
+
+          const rect = node.getBoundingClientRect();
+          return rect.width >= 300 && rect.height >= 60;
+        }
+      );
+      if (classBlocks.length > 0) {
+        return classBlocks;
+      }
+
       const explicitBlocks = Array.from(root.querySelectorAll("[comment-item]"));
       if (explicitBlocks.length > 0) {
         return explicitBlocks;
@@ -1204,11 +1642,17 @@ async function extractCommentSnapshot(page) {
           const replyButtonCount = Array.from(current.querySelectorAll("button, div, span")).filter(
             (child) => normalize(child.textContent || "") === "回复"
           ).length;
-          const hasAvatar = Boolean(
-            current.querySelector('img, [class*="avatar"], [class*="Avatar"]')
-          );
+          const avatarCount = current.querySelectorAll(
+            'img, [class*="avatar"], [class*="Avatar"]'
+          ).length;
 
-          if (hasAvatar && replyButtonCount >= 1 && replyButtonCount <= 3 && text.length <= 1200) {
+          if (
+            avatarCount >= 1 &&
+            avatarCount <= 12 &&
+            replyButtonCount >= 1 &&
+            replyButtonCount <= 20 &&
+            text.length <= 4000
+          ) {
             return current;
           }
 
@@ -1231,73 +1675,190 @@ async function extractCommentSnapshot(page) {
       return blocks;
     };
 
-    return collectBlocks()
+    const rawBlocks = collectBlocks()
       .map((block, domIndex) => {
         if (block instanceof HTMLElement) {
           block.setAttribute("data-codex-comment-block", String(domIndex));
         }
 
-        const rawLines = (block.innerText || "")
-          .split(/\n+/)
-          .map((line) => normalize(line))
-          .filter(Boolean);
+        const rawLines = splitLines(block.innerText || "");
 
         if (rawLines.length === 0) {
           return null;
         }
 
-        const contentLines = rawLines.filter(
-          (line) => !controlPattern.test(line) && !pureNumberPattern.test(line)
-        );
-
-        if (contentLines.length < 2) {
-          return null;
+        const rect = block instanceof HTMLElement ? block.getBoundingClientRect() : null;
+        const structuredBlock = extractStructuredEntryFromBlock(block, domIndex);
+        if (structuredBlock) {
+          return {
+            domIndex,
+            left: Number.isFinite(rect?.left) ? rect.left : 0,
+            top: Number.isFinite(rect?.top) ? rect.top : domIndex,
+            replyCount: structuredBlock.replyCount,
+            rawText: structuredBlock.rawText,
+            inlineReplies: structuredBlock.inlineReplies,
+            entry: structuredBlock.entry
+          };
         }
 
-        const username = contentLines[0];
-        let commentText = "";
-        let publishText = "";
-        const extraLines = [];
-
-        for (let index = 1; index < contentLines.length; index += 1) {
-          const line = contentLines[index];
-          if (!commentText && !metaPattern.test(line)) {
-            commentText = line;
-            continue;
-          }
-
-          if (!publishText && metaPattern.test(line)) {
-            publishText = line;
-            continue;
-          }
-
-          extraLines.push(line);
-        }
-
-        if (!username || !commentText) {
+        const mainEntry = parseStructuredEntry(rawLines, domIndex);
+        if (!mainEntry) {
           return null;
         }
 
         const replyThreadLine = rawLines.find((line) => line.includes("条回复")) || "";
         const replyCount = Number.parseInt(replyThreadLine.match(/\d+/)?.[0] ?? "0", 10);
-        const hasAuthorReply = Array.from(block.querySelectorAll("span, div")).some(
-          (node) => normalize(node.textContent || "") === "作者"
-        );
+        const repliesFromNodes = parseRepliesFromNodes(block, mainEntry);
+        const repliesFromLines =
+          repliesFromNodes.length > 0 ? [] : parseRepliesFromLines(rawLines, mainEntry);
+        const inlineReplies = dedupeReplies([...repliesFromNodes, ...repliesFromLines]);
 
         return {
           domIndex,
-          username,
-          commentText,
-          publishText,
+          left: Number.isFinite(rect?.left) ? rect.left : 0,
+          top: Number.isFinite(rect?.top) ? rect.top : domIndex,
           replyCount: Number.isNaN(replyCount) ? 0 : replyCount,
-          hasAuthorReply,
-          extraLines,
           rawText: normalize(block.innerText || ""),
-          signature: [username, commentText, publishText].map(normalize).join("|"),
-          order: domIndex
+          inlineReplies,
+          entry: mainEntry
         };
       })
       .filter(Boolean);
+
+    const resolveReplyIndentThreshold = (blocks) => {
+      const leftPositions = blocks
+        .map((block) => block.left)
+        .filter((value) => Number.isFinite(value))
+        .sort((left, right) => left - right);
+
+      if (leftPositions.length === 0) {
+        return Number.POSITIVE_INFINITY;
+      }
+
+      const bands = [];
+      for (const left of leftPositions) {
+        const lastBand = bands[bands.length - 1];
+        if (!lastBand || Math.abs(left - lastBand.max) > xBandTolerance) {
+          bands.push({
+            min: left,
+            max: left,
+            values: [left]
+          });
+          continue;
+        }
+
+        lastBand.max = left;
+        lastBand.values.push(left);
+      }
+
+      if (bands.length < 2) {
+        return Number.POSITIVE_INFINITY;
+      }
+
+      const mainBand = bands[0];
+      const mainAnchor =
+        mainBand.values.reduce((sum, value) => sum + value, 0) / mainBand.values.length;
+      const replyBand = bands.find(
+        (band, index) => index > 0 && band.min - mainAnchor >= replyIndentMinDelta
+      );
+
+      if (!replyBand) {
+        return Number.POSITIVE_INFINITY;
+      }
+
+      return (mainAnchor + replyBand.min) / 2;
+    };
+
+    const replyIndentThreshold = resolveReplyIndentThreshold(rawBlocks);
+    const orderedBlocks = rawBlocks
+      .slice()
+      .sort((left, right) =>
+        left.top === right.top ? left.left - right.left : left.top - right.top
+      );
+
+    const comments = [];
+    let currentMainComment = null;
+
+    const flushCurrentMainComment = () => {
+      if (!currentMainComment) {
+        return;
+      }
+
+      const replies = dedupeReplies([
+        ...currentMainComment.inlineReplies,
+        ...currentMainComment.replies
+      ]);
+
+      comments.push({
+        domIndex: currentMainComment.domIndex,
+        username: currentMainComment.username,
+        commentText: currentMainComment.commentText,
+        publishText: currentMainComment.publishText,
+        replyCount: Math.max(currentMainComment.replyCount, replies.length),
+        hasAuthorReply: replies.some((reply) => reply.hasAuthorBadge),
+        extraLines: replies.length > 0 ? [] : currentMainComment.extraLines,
+        rawText: currentMainComment.rawText,
+        replies,
+        signature: currentMainComment.signature,
+        order: currentMainComment.order
+      });
+
+      currentMainComment = null;
+    };
+
+    for (const block of orderedBlocks) {
+      const entry = block.entry;
+      if (!entry?.signature) {
+        continue;
+      }
+
+      const isReplyBlock =
+        Number.isFinite(replyIndentThreshold) && block.left >= replyIndentThreshold;
+
+      if (!isReplyBlock || !currentMainComment) {
+        flushCurrentMainComment();
+        currentMainComment = {
+          domIndex: block.domIndex,
+          username: entry.username,
+          commentText: entry.commentText,
+          publishText: entry.publishText,
+          replyCount: block.replyCount,
+          extraLines: entry.extraLines,
+          rawText: block.rawText,
+          inlineReplies: block.inlineReplies,
+          replies: [],
+          signature: entry.signature,
+          order: block.domIndex
+        };
+        continue;
+      }
+
+      currentMainComment.replies.push({
+        username: entry.username,
+        commentText: entry.commentText,
+        publishText: entry.publishText,
+        hasAuthorBadge: entry.hasAuthorBadge,
+        extraLines: entry.extraLines,
+        rawText: block.rawText,
+        signature: `${entry.signature}|slot:${currentMainComment.inlineReplies.length + currentMainComment.replies.length}`,
+        order: currentMainComment.inlineReplies.length + currentMainComment.replies.length
+      });
+
+      if (Array.isArray(block.inlineReplies) && block.inlineReplies.length > 0) {
+        const baseOrder =
+          currentMainComment.inlineReplies.length + currentMainComment.replies.length;
+        currentMainComment.replies.push(
+          ...block.inlineReplies.map((reply, index) => ({
+            ...reply,
+            order:
+              typeof reply.order === "number" ? baseOrder + reply.order : baseOrder + index
+          }))
+        );
+      }
+    }
+
+    flushCurrentMainComment();
+    return comments;
   });
 }
 
@@ -1305,12 +1866,45 @@ function addCommentsFromSnapshot(commentsBySignature, snapshot) {
   let additions = 0;
 
   for (const comment of snapshot) {
-    if (!comment.signature || commentsBySignature.has(comment.signature)) {
+    if (!comment.signature) {
       continue;
     }
 
-    commentsBySignature.set(comment.signature, comment);
-    additions += 1;
+    const existingComment = commentsBySignature.get(comment.signature);
+    if (!existingComment) {
+      commentsBySignature.set(comment.signature, comment);
+      additions += 1;
+      continue;
+    }
+
+    const mergedReplies = mergeReplyArrays(existingComment.replies, comment.replies);
+    commentsBySignature.set(comment.signature, {
+      ...existingComment,
+      ...comment,
+      publishText:
+        comment.publishText && comment.publishText.length >= (existingComment.publishText ?? "").length
+          ? comment.publishText
+          : existingComment.publishText,
+      extraLines:
+        Array.isArray(comment.extraLines) &&
+        comment.extraLines.length >= (existingComment.extraLines?.length ?? 0)
+          ? comment.extraLines
+          : existingComment.extraLines,
+      rawText:
+        (comment.rawText ?? "").length >= (existingComment.rawText ?? "").length
+          ? comment.rawText
+          : existingComment.rawText,
+      replyCount: Math.max(existingComment.replyCount ?? 0, comment.replyCount ?? 0),
+      hasAuthorReply: Boolean(existingComment.hasAuthorReply || comment.hasAuthorReply),
+      replies: mergedReplies.replies,
+      order:
+        typeof existingComment.order === "number" && typeof comment.order === "number"
+          ? Math.min(existingComment.order, comment.order)
+          : typeof existingComment.order === "number"
+            ? existingComment.order
+            : comment.order
+    });
+    additions += mergedReplies.additions;
   }
 
   return additions;
@@ -1478,6 +2072,37 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
   };
 
   try {
+    const normalizedReplyMessage = normalizeText(options.replyMessage ?? "");
+    const hasDuplicateReplyMessage =
+      Boolean(normalizedReplyMessage) &&
+      Array.isArray(comment.replies) &&
+      comment.replies.some((reply) => {
+        if (!reply?.hasAuthorBadge) {
+          return false;
+        }
+
+        return normalizeText(
+          reply.rawText ??
+            [reply.commentText, reply.publishText, ...(reply.extraLines ?? [])]
+              .filter(Boolean)
+              .join(" ")
+        ).includes(normalizedReplyMessage);
+      });
+
+    if (hasDuplicateReplyMessage) {
+      return {
+        ...result,
+        status: "skipped_duplicate_reply_message"
+      };
+    }
+
+    if (comment.hasAuthorReply) {
+      return {
+        ...result,
+        status: "skipped_already_replied"
+      };
+    }
+
     let actionState = await inspectCommentActions(commentLocator, options.replyMessage);
 
     if (actionState.hasToggle && actionState.toggleText.includes("条回复")) {
@@ -1743,6 +2368,10 @@ async function collectComments(page, options) {
       postWaitScrollState.top >= postWaitScrollState.maxScrollTop;
 
     if (reachedBottom) {
+      if (options.expandReplies) {
+        await expandReplyThreads(page);
+      }
+
       const finalSnapshot = await extractCommentSnapshot(page);
       const finalAdditions = addCommentsFromSnapshot(commentsBySignature, finalSnapshot);
       if (finalAdditions > 0) {
@@ -1765,8 +2394,9 @@ async function collectComments(page, options) {
   }
 
   return [...commentsBySignature.values()]
+    .sort((left, right) => (left.order ?? 0) - (right.order ?? 0))
     .slice(0, options.limit)
-    .map(({ signature, domIndex, ...comment }) => comment);
+    .map(sanitizeCollectedComment);
 }
 
 async function emitResult(result, outputPath) {

@@ -6,7 +6,7 @@
 
 - 列出创作者中心当前账号下的全部作品
 - 按 `item_id` 或标题选择作品
-- 抓取作品评论并导出为 JSON
+- 抓取作品评论并导出为 JSON，同时展开并附带子回复
 - 自动回复未被作者回复过的评论
 - 默认复用本地浏览器用户目录，便于手动登录一次后持续使用
 
@@ -81,7 +81,8 @@ npm run comments -- \
 - `--output <path>`：写入 JSON 文件；不传则打印到 stdout
 - `--headless`：无头模式运行
 - `--user-data-dir <path>`：自定义 Playwright 用户目录
-- `--expand-replies`：尝试展开“条回复”后再抓取，属于 best effort
+- `--expand-replies`：展开“条回复”后再抓取，当前为默认行为
+- `--no-expand-replies`：关闭子回复展开，仅抓主评论
 
 ## 说明
 
@@ -95,4 +96,5 @@ npm run comments -- \
 - `--reply-plan-file` 支持为每条目标评论单独指定 `replyMessage`；示例格式见 [reply-plan.example.json](/Users/yangguang.wen/douyin_plugin_back/reply-plan.example.json)。
 - `reply-plan-file` 中 `commentText` 必填，`username` 和 `publishText` 选填；填得越全，定向匹配越稳。
 - 其他依赖网络或页面渲染的步骤也已经开放超时参数，包括页面打开、作品侧边栏出现、评论区出现和评论抓取总时长。
+- 评论抓取结果里每条主评论现在会附带 `replies` 数组，以及 `collectedReplyCount` 字段，表示当前实际抓到的子回复数量。
 - 评论抓取仍然基于页面 DOM，页面结构变动后可能需要微调选择器或提取规则。
