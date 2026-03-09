@@ -21,6 +21,19 @@ npm run comments -- \
   --output comments-output/list-works.json
 ```
 
+输出格式：
+
+```json
+{
+  "count": 2,
+  "works": [
+    {
+      "title": "作品标题"
+    }
+  ]
+}
+```
+
 ## 接口 2：获取未回复评论
 
 按标题：

@@ -979,17 +979,6 @@ function hasWorkIdentity(work) {
   return Boolean(work.itemId || work.title);
 }
 
-function formatWorkForOutput(work, index) {
-  return {
-    index,
-    itemId: work.itemId,
-    secItemId: work.secItemId,
-    title: work.title,
-    publishText: work.publishText,
-    source: work.source ?? "unknown"
-  };
-}
-
 function ensureSelectableWork(targetWork) {
   if (!hasWorkIdentity(targetWork)) {
     throw new Error("The selected work is missing both item_id and title, cannot continue.");
@@ -997,7 +986,9 @@ function ensureSelectableWork(targetWork) {
 }
 
 function getWorksOutput(works) {
-  return works.map((work, index) => formatWorkForOutput(work, index));
+  return works.map((work) => ({
+    title: work.title
+  }));
 }
 
 function getSelectedWorkOutput(work) {
