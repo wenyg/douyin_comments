@@ -105,7 +105,7 @@ npm run comments -- \
 - 作品选择现在优先按标题精确匹配；如果同标题作品无法用发布时间区分，脚本会直接报歧义，建议改用 `--work-id`。
 - 回复模式会强制先切换到页面原生的“未回复”过滤；如果过滤控件不可用、找不到“未回复”选项或切换失败，脚本会直接报错退出，不再降级继续回复。
 - `--unreplied-only` 会走同一套“未回复”过滤逻辑，但只导出评论 JSON，不执行回复动作。
-- `--unreplied-only` 导出的每条评论会额外带一个空的 `replyMessage` 字段，供你手工填写后直接交给 `--reply-comments-file`。
+- `--unreplied-only` 当前输出极简 JSON：只保留 `selectedWork.title`、`count`，以及每条评论的 `username`、`commentText` 和空的 `replyMessage`。
 - `--reply-comments-file` 会自动读取文件里的 `selectedWork` 作为目标作品；如果文件缺失 `selectedWork`，再额外传 `--work-title` 或 `--work-id`。
 - `--reply-comments-file` 当前只按 `username` 匹配页面里的未回复评论，不再用 `publishText` 做限制；同一用户名多条评论时，会按页面当前顺序依次消耗计划。
 - 回复模式还会把已成功发送过的“作品 + 评论 + 回复文案”记录到 `.playwright/reply-history.json`，脚本重复执行时会优先跳过这些已发记录。

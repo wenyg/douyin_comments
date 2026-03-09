@@ -633,10 +633,6 @@ function normalizeReplyCommentsFileEntry(rawEntry, index, fallbackReplyMessage) 
     throw new Error(`reply comments item ${index + 1} requires username`);
   }
 
-  if (!commentText) {
-    throw new Error(`reply comments item ${index + 1} requires commentText`);
-  }
-
   return {
     id: index + 1,
     username,
@@ -720,17 +716,6 @@ async function loadReplyCommentsFile(replyCommentsFile, fallbackReplyMessage) {
     throw new Error(
       "reply comments file does not contain any comments with replyMessage; please fill comments[].replyMessage first"
     );
-  }
-
-  const seen = new Set();
-  for (const plan of plans) {
-    const identity = getReplyPlanIdentity(plan);
-    if (seen.has(identity)) {
-      throw new Error(
-        `Duplicate reply comment target detected for username="${plan.username}" commentText="${plan.commentText}" publishText="${plan.publishText}"`
-      );
-    }
-    seen.add(identity);
   }
 
   return {
@@ -3198,8 +3183,6 @@ async function main() {
       previewPlans: replyCommentsSource.plans.slice(0, 5).map((plan) => ({
         id: plan.id,
         username: plan.username,
-        commentText: plan.commentText,
-        publishText: plan.publishText,
         replyMessage: plan.replyMessage
       }))
     });
@@ -3333,6 +3316,24 @@ async function main() {
           replyMessage: ""
         }))
       : comments;
+
+    if (args.unrepliedOnly) {
+      await emitResult(
+        {
+          selectedWork: {
+            title: getSelectedWorkOutput(targetWork)?.title ?? ""
+          },
+          count: exportedComments.length,
+          comments: exportedComments.map((comment) => ({
+            username: comment.username,
+            commentText: comment.commentText,
+            replyMessage: ""
+          }))
+        },
+        args.output
+      );
+      return;
+    }
 
     await emitResult(
       {
