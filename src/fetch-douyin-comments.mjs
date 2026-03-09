@@ -546,6 +546,20 @@ function normalizeWork(rawWork) {
   };
 }
 
+async function waitForAsyncCondition(page, timeoutMs, predicate, intervalMs = 120) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await predicate()) {
+      return true;
+    }
+
+    await page.waitForTimeout(intervalMs);
+  }
+
+  return predicate();
+}
+
 function createWorkCollector(page) {
   const worksById = new Map();
   let responseCount = 0;
@@ -752,6 +766,23 @@ async function extractWorksFromSideSheet(sideSheet) {
   });
 }
 
+async function waitForWorksProgress(page, sideSheet, workCollector, previousState, timeoutMs) {
+  await waitForAsyncCondition(
+    page,
+    timeoutMs,
+    async () => {
+      const domCount = (await extractWorksFromSideSheet(sideSheet)).length;
+      const collectorState = workCollector.state();
+      return (
+        domCount !== previousState.domCount ||
+        collectorState.count !== previousState.apiCount ||
+        collectorState.responseCount !== previousState.responseCount
+      );
+    },
+    150
+  );
+}
+
 async function fetchAllWorks(page, workCollector, options) {
   const sideSheet = await openWorksSideSheet(page, options);
   const startedAt = Date.now();
@@ -793,7 +824,17 @@ async function fetchAllWorks(page, workCollector, options) {
 
       element.scrollTop += Math.max(element.clientHeight * 1.5, 1200);
     }, hasSignal);
-    await page.waitForTimeout(hasSignal ? 1500 : 800);
+    await waitForWorksProgress(
+      page,
+      sideSheet,
+      workCollector,
+      {
+        domCount,
+        apiCount,
+        responseCount
+      },
+      hasSignal ? 1500 : 800
+    );
   }
 
   const apiWorks = workCollector.values();
@@ -943,7 +984,7 @@ async function fetchAllWorksWithRetry(page, workCollector, options) {
     await sideSheet.evaluate((element) => {
       element.scrollTop = 0;
     });
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(200);
     return fetchAllWorks(page, workCollector, options);
   }
 }
@@ -1005,7 +1046,17 @@ async function findTargetWork(page, workCollector, options) {
 
       element.scrollTop += Math.max(element.clientHeight * 1.5, 1200);
     }, hasSignal);
-    await page.waitForTimeout(hasSignal ? 1500 : 800);
+    await waitForWorksProgress(
+      page,
+      sideSheet,
+      workCollector,
+      {
+        domCount,
+        apiCount,
+        responseCount
+      },
+      hasSignal ? 1500 : 800
+    );
   }
 
   const fallbackWorks = mergeWorkLists(workCollector.values(), latestDomWorks);
@@ -1028,7 +1079,7 @@ async function findTargetWorkWithRetry(page, workCollector, options) {
     await sideSheet.evaluate((element) => {
       element.scrollTop = 0;
     });
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(200);
     return findTargetWork(page, workCollector, options);
   }
 }
@@ -1303,6 +1354,15 @@ async function captureCommentListFingerprint(page) {
   });
 }
 
+async function waitForCommentListChange(page, previousFingerprint, timeoutMs) {
+  await waitForAsyncCondition(
+    page,
+    timeoutMs,
+    async () => (await captureCommentListFingerprint(page)) !== previousFingerprint,
+    120
+  );
+}
+
 async function applyUnrepliedCommentsFilter(page, options) {
   const filterTrigger = await waitForCommentStatusFilter(page, options);
 
@@ -1389,9 +1449,9 @@ async function applyUnrepliedCommentsFilter(page, options) {
       });
 
       if (!responseSeen && !domUpdated) {
-        await page.waitForTimeout(1000);
+        await waitForCommentListChange(page, previousFingerprint, 1000);
       } else {
-        await page.waitForTimeout(350);
+        await waitForCommentListChange(page, previousFingerprint, 350);
       }
 
       return {
@@ -1474,6 +1534,7 @@ async function markCommentScrollContainer(page) {
 }
 
 async function expandReplyThreads(page) {
+  const previousFingerprint = await captureCommentListFingerprint(page);
   const expanded = await page.evaluate(() => {
     const root =
       document.querySelector('[data-codex-comment-scroll="true"]') || document.body;
@@ -1498,7 +1559,7 @@ async function expandReplyThreads(page) {
   });
 
   if (expanded > 0) {
-    await page.waitForTimeout(1500);
+    await waitForCommentListChange(page, previousFingerprint, 1500);
   }
 }
 
@@ -2601,9 +2662,10 @@ async function replyToComments(page, options) {
       continue;
     }
 
+    const previousFingerprint = await captureCommentListFingerprint(page);
     const scrollState = await advanceCommentScroll(page, scrollContainer);
 
-    await page.waitForTimeout(1200);
+    await waitForCommentListChange(page, previousFingerprint, 1200);
 
     const nextSnapshot = await extractCommentSnapshot(page);
     const hasUnprocessed = Boolean(
@@ -2681,9 +2743,10 @@ async function collectComments(page, options) {
       break;
     }
 
+    const previousFingerprint = await captureCommentListFingerprint(page);
     const scrollState = await advanceCommentScroll(page, scrollContainer);
 
-    await page.waitForTimeout(1200);
+    await waitForCommentListChange(page, previousFingerprint, 1200);
 
     if (options.expandReplies) {
       await expandReplyThreads(page);
