@@ -24,6 +24,7 @@ Options:
   --unreplied-only          Collect only unreplied comments without sending replies
   --reply-message <text>    Reply to unreplied comments with the given text
   --reply-plan-file <path>  Reply to specific comments from a JSON plan file
+  --reply-comments-file <path>  Reply using an edited unreplied-comments JSON file
   --reply-dry-run           Enter reply mode but stop before sending any reply
   --reply-limit <n>         Max number of replies to send (default: 20)
   --reply-timeout-ms <ms>   Max wait for one reply flow (default: 30000)
@@ -69,6 +70,7 @@ function parseArgs(argv) {
     unrepliedOnly: false,
     replyMessage: "",
     replyPlanFile: "",
+    replyCommentsFile: "",
     replyDryRun: false,
     replyLimit: 20,
     replyTimeoutMs: 30000,
@@ -117,6 +119,10 @@ function parseArgs(argv) {
         break;
       case "--reply-plan-file":
         args.replyPlanFile = path.resolve(argv[index + 1] ?? "");
+        index += 1;
+        break;
+      case "--reply-comments-file":
+        args.replyCommentsFile = path.resolve(argv[index + 1] ?? "");
         index += 1;
         break;
       case "--reply-dry-run":
@@ -251,6 +257,96 @@ function logReplyFilterDebug(message, details = null) {
   const suffix =
     typeof details === "string" ? details : JSON.stringify(details, null, 2);
   console.error(`[reply-filter] ${message}: ${suffix}`);
+}
+
+function summarizeCommentsForLog(comments, limit = 3) {
+  return comments.slice(0, limit).map((comment) => ({
+    username: comment.username,
+    commentText: comment.commentText,
+    publishText: comment.publishText
+  }));
+}
+
+function parseRelativePublishText(value = "") {
+  const text = normalizeText(value);
+  if (!text) {
+    return null;
+  }
+
+  if (text === "刚刚") {
+    return {
+      unit: "minute",
+      value: 0
+    };
+  }
+
+  if (text === "昨天") {
+    return {
+      unit: "day",
+      value: 1
+    };
+  }
+
+  if (text === "前天") {
+    return {
+      unit: "day",
+      value: 2
+    };
+  }
+
+  const patterns = [
+    { regex: /^(\d+)\s*分钟前$/, unit: "minute" },
+    { regex: /^(\d+)\s*小时前$/, unit: "hour" },
+    { regex: /^(\d+)\s*天前$/, unit: "day" },
+    { regex: /^(\d+)\s*周前$/, unit: "week" },
+    { regex: /^(\d+)\s*月前$/, unit: "month" }
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern.regex);
+    if (!match) {
+      continue;
+    }
+
+    return {
+      unit: pattern.unit,
+      value: Number.parseInt(match[1], 10)
+    };
+  }
+
+  return null;
+}
+
+function arePublishTextsCompatible(expectedPublishText, actualPublishText) {
+  const expected = normalizeText(expectedPublishText).toLowerCase();
+  const actual = normalizeText(actualPublishText).toLowerCase();
+
+  if (!expected) {
+    return true;
+  }
+
+  if (expected === actual) {
+    return true;
+  }
+
+  const expectedRelative = parseRelativePublishText(expected);
+  const actualRelative = parseRelativePublishText(actual);
+  if (!expectedRelative || !actualRelative || expectedRelative.unit !== actualRelative.unit) {
+    return false;
+  }
+
+  const toleranceByUnit = {
+    minute: 10,
+    hour: 2,
+    day: 2,
+    week: 1,
+    month: 1
+  };
+
+  return (
+    Math.abs(expectedRelative.value - actualRelative.value) <=
+    (toleranceByUnit[expectedRelative.unit] ?? 0)
+  );
 }
 
 function getCommentSignature(comment) {
@@ -495,6 +591,61 @@ function normalizeReplyPlanEntry(rawEntry, index, fallbackReplyMessage) {
   };
 }
 
+function normalizeSelectedWorkHint(rawWork) {
+  if (!rawWork || typeof rawWork !== "object" || Array.isArray(rawWork)) {
+    return null;
+  }
+
+  const itemId = normalizeText(String(rawWork.itemId ?? rawWork.item_id ?? ""));
+  const secItemId = normalizeText(String(rawWork.secItemId ?? rawWork.sec_item_id ?? ""));
+  const title = normalizeText(String(rawWork.title ?? ""));
+  const publishText = normalizeText(String(rawWork.publishText ?? rawWork.publish_text ?? ""));
+  const source = normalizeText(String(rawWork.source ?? "")) || "reply_comments_file";
+
+  if (!itemId && !title) {
+    return null;
+  }
+
+  return {
+    itemId,
+    secItemId,
+    title,
+    publishText,
+    source
+  };
+}
+
+function normalizeReplyCommentsFileEntry(rawEntry, index, fallbackReplyMessage) {
+  if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+    throw new Error(`reply comments item ${index + 1} must be an object`);
+  }
+
+  const username = normalizeText(String(rawEntry.username ?? ""));
+  const commentText = normalizeText(
+    String(rawEntry.commentText ?? rawEntry.comment ?? rawEntry.text ?? "")
+  );
+  const publishText = normalizeText(
+    String(rawEntry.publishText ?? rawEntry.publish ?? rawEntry.time ?? "")
+  );
+  const replyMessage = String(rawEntry.replyMessage ?? fallbackReplyMessage ?? "").trim();
+
+  if (!username) {
+    throw new Error(`reply comments item ${index + 1} requires username`);
+  }
+
+  if (!commentText) {
+    throw new Error(`reply comments item ${index + 1} requires commentText`);
+  }
+
+  return {
+    id: index + 1,
+    username,
+    commentText,
+    publishText,
+    replyMessage
+  };
+}
+
 function getReplyPlanIdentity(entry) {
   return [
     normalizeText(entry.username).toLowerCase(),
@@ -536,6 +687,58 @@ async function loadReplyPlan(replyPlanFile, fallbackReplyMessage) {
   }
 
   return plans;
+}
+
+async function loadReplyCommentsFile(replyCommentsFile, fallbackReplyMessage) {
+  const rawContent = await fs.readFile(replyCommentsFile, "utf8");
+  let parsed;
+
+  try {
+    parsed = JSON.parse(rawContent);
+  } catch (error) {
+    throw new Error(
+      `Failed to parse reply comments JSON at ${replyCommentsFile}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("reply comments file must be a JSON object with a comments array");
+  }
+
+  if (!Array.isArray(parsed.comments)) {
+    throw new Error("reply comments file requires a comments array");
+  }
+
+  const normalizedEntries = parsed.comments.map((entry, index) =>
+    normalizeReplyCommentsFileEntry(entry, index, fallbackReplyMessage)
+  );
+  const plans = normalizedEntries.filter((entry) => entry.replyMessage);
+
+  if (plans.length === 0) {
+    throw new Error(
+      "reply comments file does not contain any comments with replyMessage; please fill comments[].replyMessage first"
+    );
+  }
+
+  const seen = new Set();
+  for (const plan of plans) {
+    const identity = getReplyPlanIdentity(plan);
+    if (seen.has(identity)) {
+      throw new Error(
+        `Duplicate reply comment target detected for username="${plan.username}" commentText="${plan.commentText}" publishText="${plan.publishText}"`
+      );
+    }
+    seen.add(identity);
+  }
+
+  return {
+    selectedWork: normalizeSelectedWorkHint(parsed.selectedWork),
+    plans,
+    totalCount: normalizedEntries.length,
+    actionableCount: plans.length
+  };
 }
 
 function normalizeWork(rawWork) {
@@ -2338,7 +2541,7 @@ function addCommentsFromSnapshot(commentsBySignature, snapshot) {
   return additions;
 }
 
-function matchReplyPlan(comment, replyPlans, processedPlanIds) {
+function matchReplyPlan(comment, replyPlans, processedPlanIds, matchMode = "strict") {
   if (!Array.isArray(replyPlans) || replyPlans.length === 0) {
     return null;
   }
@@ -2352,6 +2555,18 @@ function matchReplyPlan(comment, replyPlans, processedPlanIds) {
       continue;
     }
 
+    if (matchMode === "username_only") {
+      if (!plan.username) {
+        continue;
+      }
+
+      if (normalizeText(plan.username).toLowerCase() !== commentUsername) {
+        continue;
+      }
+
+      return plan;
+    }
+
     if (normalizeText(plan.commentText).toLowerCase() !== commentText) {
       continue;
     }
@@ -2360,7 +2575,7 @@ function matchReplyPlan(comment, replyPlans, processedPlanIds) {
       continue;
     }
 
-    if (plan.publishText && normalizeText(plan.publishText).toLowerCase() !== commentPublishText) {
+    if (!arePublishTextsCompatible(plan.publishText, commentPublishText)) {
       continue;
     }
 
@@ -2381,7 +2596,12 @@ function getNextReplyTarget(snapshot, options, processedSignatures, processedPla
         continue;
       }
 
-      const plan = matchReplyPlan(comment, options.replyPlans, processedPlanIds);
+      const plan = matchReplyPlan(
+        comment,
+        options.replyPlans,
+        processedPlanIds,
+        options.replyMatchMode
+      );
       if (!plan) {
         continue;
       }
@@ -2499,8 +2719,16 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
     publishText: comment.publishText,
     status: "pending"
   };
+  let stage = "start";
 
   try {
+    logReplyFilterDebug("processing reply target", {
+      username: comment.username,
+      commentText: comment.commentText,
+      publishText: comment.publishText,
+      requestedReplyMessage: options.replyMessage
+    });
+
     const normalizedReplyMessage = normalizeText(options.replyMessage ?? "");
     const hasDuplicateReplyMessage =
       Boolean(normalizedReplyMessage) &&
@@ -2533,12 +2761,23 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
     }
 
     let actionState = await inspectCommentActions(commentLocator, options.replyMessage);
+    logReplyFilterDebug("initial comment action state", {
+      username: comment.username,
+      commentText: comment.commentText,
+      actionState
+    });
 
     if (actionState.hasToggle && actionState.toggleText.includes("条回复")) {
+      stage = "expand_replies";
       const toggleButton = commentLocator.locator('[data-codex-toggle-action="true"]').first();
       await toggleButton.click();
       await page.waitForTimeout(Math.min(1000, options.replySettleMs));
       actionState = await inspectCommentActions(commentLocator, options.replyMessage);
+      logReplyFilterDebug("action state after expanding replies", {
+        username: comment.username,
+        commentText: comment.commentText,
+        actionState
+      });
     }
 
     if (actionState.hasDuplicateReplyMessage) {
@@ -2563,32 +2802,54 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
     }
 
     const replyButton = commentLocator.locator('[data-codex-reply-action="true"]').first();
+    stage = "click_reply_button";
     await replyButton.click();
 
     const inputBox = commentLocator.locator('div[contenteditable="true"]').last();
+    stage = "wait_input_box";
     await inputBox.waitFor({
       state: "visible",
       timeout: getEffectiveTimeout(options, options.replyTimeoutMs)
     });
+    stage = "type_reply";
     await inputBox.click();
     await inputBox.type(options.replyMessage, {
       delay: options.replyTypeDelayMs
     });
 
+    stage = "wait_send_button";
     await waitForReplySendReady(page, commentLocator, options.replyTimeoutMs, options);
 
     const sendButton = commentLocator.getByText("发送", { exact: true }).first();
+    stage = "click_send_button";
     await sendButton.click();
+    logReplyFilterDebug("clicked send button", {
+      username: comment.username,
+      commentText: comment.commentText
+    });
+
+    stage = "settle_after_send";
     await page.waitForTimeout(options.replySettleMs);
 
+    logReplyFilterDebug("reply completed", {
+      username: comment.username,
+      commentText: comment.commentText
+    });
     return {
       ...result,
       status: "replied"
     };
   } catch (error) {
+    logReplyFilterDebug("reply failed", {
+      username: comment.username,
+      commentText: comment.commentText,
+      stage,
+      error: error instanceof Error ? error.message : String(error)
+    });
     return {
       ...result,
       status: "error",
+      errorStage: stage,
       error: error instanceof Error ? error.message : String(error)
     };
   }
@@ -2605,6 +2866,7 @@ async function replyToComments(page, options) {
   const results = [];
   let repliedCount = 0;
   let lastProgressAt = startedAt;
+  let loggedNoMatchSnapshot = false;
 
   while (Date.now() - startedAt < timeoutMs) {
     if (Array.isArray(options.replyPlans) && processedPlanIds.size >= options.replyPlans.length) {
@@ -2621,6 +2883,14 @@ async function replyToComments(page, options) {
 
     if (nextTarget) {
       const { comment: nextComment, plan, replyMessage } = nextTarget;
+      logReplyFilterDebug("matched reply target", {
+        username: nextComment.username,
+        commentText: nextComment.commentText,
+        publishText: nextComment.publishText,
+        planPublishText: plan?.publishText ?? null,
+        replyPlanId: plan?.id ?? null,
+        requestedReplyMessage: replyMessage
+      });
       if (options.replyDryRun) {
         processedSignatures.add(nextComment.signature);
         if (plan) {
@@ -2706,6 +2976,24 @@ async function replyToComments(page, options) {
       }
 
       continue;
+    }
+
+    if (options.replyPlanMode && !loggedNoMatchSnapshot) {
+      const remainingPlans = options.replyPlans
+        .filter((plan) => !processedPlanIds.has(plan.id))
+        .slice(0, 5)
+        .map((plan) => ({
+          id: plan.id,
+          username: plan.username,
+          commentText: plan.commentText,
+          publishText: plan.publishText,
+          replyMessage: plan.replyMessage
+        }));
+      logReplyFilterDebug("no visible comment matched current reply plans", {
+        visibleComments: summarizeCommentsForLog(snapshot, 5),
+        remainingPlans
+      });
+      loggedNoMatchSnapshot = true;
     }
 
     const previousFingerprint = await captureCommentListFingerprint(page);
@@ -2854,10 +3142,29 @@ async function main() {
     return;
   }
 
-  const replyPlans = args.replyPlanFile
-    ? await loadReplyPlan(args.replyPlanFile, args.replyMessage)
-    : [];
-  const isReplyMode = Boolean(args.replyMessage || args.replyPlanFile || args.replyDryRun);
+  if (args.replyPlanFile && args.replyCommentsFile) {
+    throw new Error("Use either --reply-plan-file or --reply-comments-file, not both.");
+  }
+
+  const replyCommentsSource = args.replyCommentsFile
+    ? await loadReplyCommentsFile(args.replyCommentsFile, args.replyMessage)
+    : null;
+  const replyPlans = args.replyCommentsFile
+    ? replyCommentsSource.plans
+    : args.replyPlanFile
+      ? await loadReplyPlan(args.replyPlanFile, args.replyMessage)
+      : [];
+  const requestedWorkId = args.workId || replyCommentsSource?.selectedWork?.itemId || "";
+  const requestedWorkTitle = args.workTitle || replyCommentsSource?.selectedWork?.title || "";
+  if (args.replyCommentsFile && !requestedWorkId && !requestedWorkTitle) {
+    throw new Error(
+      "reply comments file is missing selectedWork; please pass --work-title or --work-id explicitly."
+    );
+  }
+  const isReplyMode = Boolean(
+    args.replyMessage || args.replyPlanFile || args.replyCommentsFile || args.replyDryRun
+  );
+  const replyMatchMode = args.replyCommentsFile ? "username_only" : "strict";
   const replyHistory = isReplyMode ? await loadReplyHistory() : null;
   const runtimeBudget = args.maxRuntimeMs
     ? {
@@ -2871,15 +3178,32 @@ async function main() {
 
   logReplyFilterDebug("startup", {
     listWorks: args.listWorks,
-    workId: args.workId || null,
-    workTitle: args.workTitle || null,
+    workId: requestedWorkId || null,
+    workTitle: requestedWorkTitle || null,
     maxRuntimeMs: args.maxRuntimeMs || null,
     unrepliedOnly: args.unrepliedOnly,
     isReplyMode,
-    replyPlanMode: Boolean(args.replyPlanFile),
+    replyPlanMode: Boolean(args.replyPlanFile || args.replyCommentsFile),
+    replyMatchMode,
+    replyCommentsFile: args.replyCommentsFile || null,
     replyDryRun: args.replyDryRun,
     headless: args.headless
   });
+  if (replyCommentsSource) {
+    logReplyFilterDebug("loaded reply comments file", {
+      filePath: args.replyCommentsFile,
+      selectedWork: replyCommentsSource.selectedWork,
+      totalCount: replyCommentsSource.totalCount,
+      actionableCount: replyCommentsSource.actionableCount,
+      previewPlans: replyCommentsSource.plans.slice(0, 5).map((plan) => ({
+        id: plan.id,
+        username: plan.username,
+        commentText: plan.commentText,
+        publishText: plan.publishText,
+        replyMessage: plan.replyMessage
+      }))
+    });
+  }
 
   const context = await chromium.launchPersistentContext(args.userDataDir, {
     headless: args.headless,
@@ -2928,11 +3252,11 @@ async function main() {
       return;
     }
 
-    if (args.workId || args.workTitle) {
+    if (requestedWorkId || requestedWorkTitle) {
       targetWork = await findTargetWorkWithRetry(page, workCollector, {
         ...runtimeBudget,
-        workId: args.workId,
-        workTitle: args.workTitle,
+        workId: requestedWorkId,
+        workTitle: requestedWorkTitle,
         timeoutMs: args.worksTimeoutMs,
         idleMs: args.worksIdleMs,
         uiTimeoutMs: args.uiTimeoutMs
@@ -2960,7 +3284,8 @@ async function main() {
         ...runtimeBudget,
         replyMessage: args.replyMessage,
         replyPlans,
-        replyPlanMode: Boolean(args.replyPlanFile),
+        replyPlanMode: Boolean(args.replyPlanFile || args.replyCommentsFile),
+        replyMatchMode,
         replyDryRun: args.replyDryRun,
         replyHistory,
         selectedWork: targetWork,
@@ -2982,6 +3307,7 @@ async function main() {
           timeoutMs: args.maxRuntimeMs || null,
           replyMessage: args.replyMessage,
           replyPlanFile: args.replyPlanFile || null,
+          replyCommentsFile: args.replyCommentsFile || null,
           replyDryRun: args.replyDryRun,
           replyHistoryFile: replyHistory?.filePath ?? null,
           replyLimit: args.replyLimit,
@@ -3001,6 +3327,12 @@ async function main() {
       idleMs: args.commentsIdleMs,
       uiTimeoutMs: args.uiTimeoutMs
     });
+    const exportedComments = args.unrepliedOnly
+      ? comments.map((comment) => ({
+          ...comment,
+          replyMessage: ""
+        }))
+      : comments;
 
     await emitResult(
       {
@@ -3009,8 +3341,8 @@ async function main() {
         selectedWork: getSelectedWorkOutput(targetWork),
         timeoutMs: args.maxRuntimeMs || null,
         commentFilter: args.unrepliedOnly ? "unreplied" : "all",
-        count: comments.length,
-        comments
+        count: exportedComments.length,
+        comments: exportedComments
       },
       args.output
     );

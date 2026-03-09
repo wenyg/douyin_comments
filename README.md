@@ -60,6 +60,14 @@ npm run comments -- \
   --output comments-output/reply-plan-result.json
 ```
 
+先导出未回复评论、补上 `comments[].replyMessage` 后再执行回复：
+
+```bash
+npm run comments -- \
+  --reply-comments-file comments-output/unreplied-comments.json \
+  --output comments-output/reply-comments-result.json
+```
+
 常用参数：
 
 - `--list-works`：只拉取并输出作品列表
@@ -69,6 +77,7 @@ npm run comments -- \
 - `--unreplied-only`：只导出“未回复”评论，不发送回复
 - `--reply-message <text>`：开启回复模式，按给定文案回复未回复评论
 - `--reply-plan-file <path>`：按 JSON 文件中的匹配规则，给特定评论回复指定文案
+- `--reply-comments-file <path>`：读取 `--unreplied-only` 导出的 JSON，并按其中 `comments[].replyMessage` 执行回复；当前按 `username` 匹配
 - `--reply-dry-run`：进入回复模式并强制切到“未回复”，但在真正发送前停止，便于排查流程
 - `--reply-limit <n>`：最多发送多少条回复，默认 `20`
 - `--reply-timeout-ms <ms>`：单条回复流程最大等待时间，默认 `30000`
@@ -96,6 +105,9 @@ npm run comments -- \
 - 作品选择现在优先按标题精确匹配；如果同标题作品无法用发布时间区分，脚本会直接报歧义，建议改用 `--work-id`。
 - 回复模式会强制先切换到页面原生的“未回复”过滤；如果过滤控件不可用、找不到“未回复”选项或切换失败，脚本会直接报错退出，不再降级继续回复。
 - `--unreplied-only` 会走同一套“未回复”过滤逻辑，但只导出评论 JSON，不执行回复动作。
+- `--unreplied-only` 导出的每条评论会额外带一个空的 `replyMessage` 字段，供你手工填写后直接交给 `--reply-comments-file`。
+- `--reply-comments-file` 会自动读取文件里的 `selectedWork` 作为目标作品；如果文件缺失 `selectedWork`，再额外传 `--work-title` 或 `--work-id`。
+- `--reply-comments-file` 当前只按 `username` 匹配页面里的未回复评论，不再用 `publishText` 做限制；同一用户名多条评论时，会按页面当前顺序依次消耗计划。
 - 回复模式还会把已成功发送过的“作品 + 评论 + 回复文案”记录到 `.playwright/reply-history.json`，脚本重复执行时会优先跳过这些已发记录。
 - `--reply-plan-file` 支持为每条目标评论单独指定 `replyMessage`；示例格式见 [reply-plan.example.json](/Users/yangguang.wen/douyin_plugin_back/reply-plan.example.json)。
 - `reply-plan-file` 中 `commentText` 必填，`username` 和 `publishText` 选填；填得越全，定向匹配越稳。
