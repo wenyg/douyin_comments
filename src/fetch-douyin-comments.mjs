@@ -1482,6 +1482,62 @@ async function expandReplyThreads(page) {
   }
 }
 
+async function advanceCommentScroll(page, scrollContainer) {
+  const containerState = await scrollContainer.evaluate((element) => {
+    const before = element.scrollTop;
+    const maxScrollTop = Math.max(element.scrollHeight - element.clientHeight, 0);
+    const next = Math.min(before + Math.max(element.clientHeight * 0.9, 900), maxScrollTop);
+    element.scrollTop = next;
+    return {
+      before,
+      after: element.scrollTop,
+      maxScrollTop,
+      strategy: "container"
+    };
+  });
+
+  if (containerState.after > containerState.before) {
+    return containerState;
+  }
+
+  await scrollContainer.scrollIntoViewIfNeeded().catch(() => {});
+  await page.mouse.wheel(0, 1400);
+  await page.waitForTimeout(150);
+
+  const wheelState = await scrollContainer.evaluate((element, before) => {
+    return {
+      before,
+      after: element.scrollTop,
+      maxScrollTop: Math.max(element.scrollHeight - element.clientHeight, 0),
+      strategy: "wheel"
+    };
+  }, containerState.after);
+
+  if (
+    wheelState.after > wheelState.before ||
+    wheelState.maxScrollTop > containerState.maxScrollTop
+  ) {
+    return wheelState;
+  }
+
+  return page.evaluate(() => {
+    const element =
+      document.scrollingElement instanceof HTMLElement
+        ? document.scrollingElement
+        : document.documentElement;
+    const before = element.scrollTop;
+    const maxScrollTop = Math.max(element.scrollHeight - element.clientHeight, 0);
+    const next = Math.min(before + Math.max(window.innerHeight * 0.9, 900), maxScrollTop);
+    element.scrollTop = next;
+    return {
+      before,
+      after: element.scrollTop,
+      maxScrollTop,
+      strategy: "page"
+    };
+  });
+}
+
 async function extractCommentSnapshot(page) {
   return page.evaluate(() => {
     const root =
@@ -2525,17 +2581,7 @@ async function replyToComments(page, options) {
       continue;
     }
 
-    const scrollState = await scrollContainer.evaluate((element) => {
-      const before = element.scrollTop;
-      const maxScrollTop = Math.max(element.scrollHeight - element.clientHeight, 0);
-      const next = Math.min(before + Math.max(element.clientHeight * 0.9, 900), maxScrollTop);
-      element.scrollTop = next;
-      return {
-        before,
-        after: element.scrollTop,
-        maxScrollTop
-      };
-    });
+    const scrollState = await advanceCommentScroll(page, scrollContainer);
 
     await page.waitForTimeout(1200);
 
@@ -2598,6 +2644,7 @@ async function collectComments(page, options) {
   const commentsBySignature = new Map();
   const startedAt = Date.now();
   let lastProgressAt = startedAt;
+  let stalledScrollAttempts = 0;
 
   while (Date.now() - startedAt < options.timeoutMs) {
     if (options.expandReplies) {
@@ -2614,53 +2661,37 @@ async function collectComments(page, options) {
       break;
     }
 
-    const scrollState = await scrollContainer.evaluate((element) => {
-      const before = element.scrollTop;
-      const maxScrollTop = Math.max(element.scrollHeight - element.clientHeight, 0);
-      const next = Math.min(before + Math.max(element.clientHeight * 0.9, 900), maxScrollTop);
-      element.scrollTop = next;
-      return {
-        before,
-        after: element.scrollTop,
-        maxScrollTop
-      };
-    });
+    const scrollState = await advanceCommentScroll(page, scrollContainer);
 
     await page.waitForTimeout(1200);
 
-    const postWaitScrollState = await scrollContainer.evaluate((element) => {
-      return {
-        top: element.scrollTop,
-        maxScrollTop: Math.max(element.scrollHeight - element.clientHeight, 0)
-      };
-    });
+    if (options.expandReplies) {
+      await expandReplyThreads(page);
+    }
 
-    const reachedBottom =
-      scrollState.after === scrollState.before ||
-      postWaitScrollState.top >= postWaitScrollState.maxScrollTop;
+    const postScrollSnapshot = await extractCommentSnapshot(page);
+    const postScrollAdditions = addCommentsFromSnapshot(commentsBySignature, postScrollSnapshot);
+    if (postScrollAdditions > 0) {
+      lastProgressAt = Date.now();
+    }
 
-    if (reachedBottom) {
-      if (options.expandReplies) {
-        await expandReplyThreads(page);
-      }
+    const scrollMoved = scrollState.after > scrollState.before;
+    if (additions > 0 || postScrollAdditions > 0 || scrollMoved) {
+      stalledScrollAttempts = 0;
+    } else {
+      stalledScrollAttempts += 1;
+    }
 
-      const finalSnapshot = await extractCommentSnapshot(page);
-      const finalAdditions = addCommentsFromSnapshot(commentsBySignature, finalSnapshot);
-      if (finalAdditions > 0) {
-        lastProgressAt = Date.now();
-      }
+    if (commentsBySignature.size >= options.limit) {
+      break;
+    }
 
-      if (commentsBySignature.size >= options.limit) {
-        break;
-      }
-
-      if (finalAdditions === 0) {
-        break;
-      }
+    if (stalledScrollAttempts >= 4) {
+      break;
     }
 
     const idleElapsedMs = Date.now() - lastProgressAt;
-    if (idleElapsedMs >= options.idleMs) {
+    if (idleElapsedMs >= options.idleMs && stalledScrollAttempts >= 2) {
       break;
     }
   }
