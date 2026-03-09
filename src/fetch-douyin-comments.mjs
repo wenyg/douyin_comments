@@ -1135,7 +1135,25 @@ async function selectWorkFromSideSheet(page, targetWork, options) {
       const workCard = sideSheet.locator('[data-codex-target-work="true"]').first();
       await workCard.scrollIntoViewIfNeeded();
       await workCard.click();
-      await page.waitForTimeout(1800);
+      const fastReadyTimeoutMs = Math.min(options.uiTimeoutMs, 2500);
+      await Promise.race([
+        sideSheet.waitFor({ state: "hidden", timeout: fastReadyTimeoutMs }).catch(() => null),
+        page
+          .locator('[role="combobox"].douyin-creator-interactive-select')
+          .first()
+          .waitFor({ state: "visible", timeout: fastReadyTimeoutMs })
+          .catch(() => null),
+        page
+          .locator('[comment-item]').first()
+          .waitFor({ state: "visible", timeout: fastReadyTimeoutMs })
+          .catch(() => null),
+        page
+          .locator('button:has-text("回复"), div:has-text("回复")')
+          .first()
+          .waitFor({ state: "visible", timeout: fastReadyTimeoutMs })
+          .catch(() => null),
+        page.waitForTimeout(300)
+      ]);
       return;
     }
 
@@ -1172,14 +1190,16 @@ async function waitForCommentsArea(page, options) {
     page.locator('[comment-item]').first(),
     page.locator('button:has-text("回复"), div:has-text("回复")').first()
   ];
+  const startedAt = Date.now();
 
-  for (const locator of candidates) {
-    try {
-      await locator.waitFor({ state: "visible", timeout: options.uiTimeoutMs });
-      return;
-    } catch (error) {
-      // Ignore and try the next locator.
+  while (Date.now() - startedAt < options.uiTimeoutMs) {
+    for (const locator of candidates) {
+      if (await locator.isVisible().catch(() => false)) {
+        return;
+      }
     }
+
+    await page.waitForTimeout(200);
   }
 
   throw new Error(
