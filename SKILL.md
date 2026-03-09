@@ -31,7 +31,7 @@ The output shape is:
 
 ```json
 {
-  "count": 2,
+  "count": 1,
   "works": [
     { "title": "作品标题" }
   ]
@@ -40,7 +40,7 @@ The output shape is:
 
 ## 2. Export unreplied comments
 
-Require either `--work-title` or `--work-id`.
+Require either `--work-title`
 
 ```bash
 npm run comments -- \
