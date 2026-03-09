@@ -13,6 +13,32 @@ npm install
 npx playwright install chromium
 ```
 
+## OpenClaw Skill
+
+如果你想把整个工程直接作为 OpenClaw skill 使用，推荐把整个目录放到 `~/.openclaw/skills/douyin-comments`。
+
+软链接方式：
+
+```bash
+mkdir -p ~/.openclaw/skills
+ln -s /path/to/douyin_plugin_back ~/.openclaw/skills/douyin-comments
+```
+
+复制方式：
+
+```bash
+mkdir -p ~/.openclaw/skills
+cp -R /path/to/douyin_plugin_back ~/.openclaw/skills/douyin-comments
+```
+
+这个工程根目录现在已经直接包含 OpenClaw 需要的 [SKILL.md](/Users/yangguang.wen/douyin_plugin_back/SKILL.md) 和 [agents/openai.yaml](/Users/yangguang.wen/douyin_plugin_back/agents/openai.yaml)，所以不用再单独拆 skill 子目录。
+
+放好之后：
+
+- 在 `~/.openclaw/skills/douyin-comments` 下执行一次 `npm install`
+- 第一次登录不要用 `--headless`
+- 修改 skill 或工程后，最好新开一个 OpenClaw session 或刷新 skills
+
 ## 接口 1：获取作品列表
 
 ```bash
