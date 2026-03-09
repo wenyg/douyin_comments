@@ -20,6 +20,7 @@ Options:
   --list-works              Fetch and print all works from the side sheet
   --work-id <item_id>       Select a work by item_id
   --work-title <title>      Select a work by title
+  --timeout-ms <ms>         Max total runtime for the whole command
   --unreplied-only          Collect only unreplied comments without sending replies
   --reply-message <text>    Reply to unreplied comments with the given text
   --reply-plan-file <path>  Reply to specific comments from a JSON plan file
@@ -64,6 +65,7 @@ function parseArgs(argv) {
     output: "",
     workId: "",
     workTitle: "",
+    maxRuntimeMs: 0,
     unrepliedOnly: false,
     replyMessage: "",
     replyPlanFile: "",
@@ -100,6 +102,10 @@ function parseArgs(argv) {
         break;
       case "--work-title":
         args.workTitle = normalizeText(argv[index + 1] ?? "");
+        index += 1;
+        break;
+      case "--timeout-ms":
+        args.maxRuntimeMs = toPositiveInteger(argv[index + 1], "--timeout-ms");
         index += 1;
         break;
       case "--unreplied-only":
@@ -217,6 +223,23 @@ function formatUnixSeconds(rawValue) {
 
 function normalizeLookupText(value = "") {
   return normalizeText(value).toLowerCase();
+}
+
+function getEffectiveTimeout(options, requestedMs) {
+  const normalizedRequestedMs = Math.max(1, Number(requestedMs) || 1);
+  const deadline = options?.deadline;
+
+  if (!deadline) {
+    return normalizedRequestedMs;
+  }
+
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    const totalMs = options?.maxRuntimeMs ? `${options.maxRuntimeMs}ms` : "global budget";
+    throw new Error(`Timed out after exhausting the global runtime budget (${totalMs}).`);
+  }
+
+  return Math.max(1, Math.min(normalizedRequestedMs, remainingMs));
 }
 
 function logReplyFilterDebug(message, details = null) {
@@ -637,9 +660,11 @@ async function promptForEnter(message) {
 }
 
 async function ensureCommentPageReady(page, pageUrl, options) {
+  const navigationTimeoutMs = getEffectiveTimeout(options, options.navigationTimeoutMs);
+  const uiTimeoutMs = getEffectiveTimeout(options, options.uiTimeoutMs);
   await page.goto(pageUrl, {
     waitUntil: "domcontentloaded",
-    timeout: options.navigationTimeoutMs
+    timeout: navigationTimeoutMs
   });
 
   const selectWorkButton = page
@@ -647,18 +672,20 @@ async function ensureCommentPageReady(page, pageUrl, options) {
     .first();
 
   try {
-    await selectWorkButton.waitFor({ state: "visible", timeout: options.uiTimeoutMs });
+    await selectWorkButton.waitFor({ state: "visible", timeout: uiTimeoutMs });
     return;
   } catch (error) {
     console.log("未检测到创作者评论页入口，请先在浏览器中完成登录。");
   }
 
   await promptForEnter("完成登录并进入创作者中心评论页后，按 Enter 继续");
+  const retryNavigationTimeoutMs = getEffectiveTimeout(options, options.navigationTimeoutMs);
+  const retryUiTimeoutMs = getEffectiveTimeout(options, options.uiTimeoutMs);
   await page.goto(pageUrl, {
     waitUntil: "domcontentloaded",
-    timeout: options.navigationTimeoutMs
+    timeout: retryNavigationTimeoutMs
   });
-  await selectWorkButton.waitFor({ state: "visible", timeout: options.uiTimeoutMs });
+  await selectWorkButton.waitFor({ state: "visible", timeout: retryUiTimeoutMs });
 }
 
 async function openWorksSideSheet(page, options) {
@@ -673,7 +700,10 @@ async function openWorksSideSheet(page, options) {
     .first();
 
   await trigger.click();
-  await sideSheet.waitFor({ state: "visible", timeout: options.uiTimeoutMs });
+  await sideSheet.waitFor({
+    state: "visible",
+    timeout: getEffectiveTimeout(options, options.uiTimeoutMs)
+  });
   return sideSheet;
 }
 
@@ -785,6 +815,7 @@ async function waitForWorksProgress(page, sideSheet, workCollector, previousStat
 
 async function fetchAllWorks(page, workCollector, options) {
   const sideSheet = await openWorksSideSheet(page, options);
+  const timeoutMs = getEffectiveTimeout(options, options.timeoutMs);
   const startedAt = Date.now();
   let lastProgressAt = startedAt;
   let previousDomCount = -1;
@@ -792,7 +823,7 @@ async function fetchAllWorks(page, workCollector, options) {
   let previousResponseCount = -1;
   let latestDomWorks = [];
 
-  while (Date.now() - startedAt < options.timeoutMs) {
+  while (Date.now() - startedAt < timeoutMs) {
     latestDomWorks = await extractWorksFromSideSheet(sideSheet);
     const domCount = latestDomWorks.length;
     const collectorState = workCollector.state();
@@ -991,6 +1022,7 @@ async function fetchAllWorksWithRetry(page, workCollector, options) {
 
 async function findTargetWork(page, workCollector, options) {
   const sideSheet = await openWorksSideSheet(page, options);
+  const timeoutMs = getEffectiveTimeout(options, options.timeoutMs);
   const startedAt = Date.now();
   let lastProgressAt = startedAt;
   let previousDomCount = -1;
@@ -999,7 +1031,7 @@ async function findTargetWork(page, workCollector, options) {
   let latestDomWorks = [];
   let bestApiMatch = null;
 
-  while (Date.now() - startedAt < options.timeoutMs) {
+  while (Date.now() - startedAt < timeoutMs) {
     latestDomWorks = await extractWorksFromSideSheet(sideSheet);
     const apiWorks = workCollector.values();
     const collectorState = workCollector.state();
@@ -1127,9 +1159,10 @@ function pickTargetWork(works, workId, workTitle) {
 async function selectWorkFromSideSheet(page, targetWork, options) {
   ensureSelectableWork(targetWork);
   const sideSheet = await openWorksSideSheet(page, options);
+  const timeoutMs = getEffectiveTimeout(options, options.timeoutMs);
   const startedAt = Date.now();
 
-  while (Date.now() - startedAt < options.timeoutMs) {
+  while (Date.now() - startedAt < timeoutMs) {
     await inspectWorksInSideSheet(sideSheet);
     const selectionState = await sideSheet.evaluate((element, work) => {
       const normalize = (value = "") => value.replace(/\s+/g, " ").trim().toLowerCase();
@@ -1186,7 +1219,10 @@ async function selectWorkFromSideSheet(page, targetWork, options) {
       const workCard = sideSheet.locator('[data-codex-target-work="true"]').first();
       await workCard.scrollIntoViewIfNeeded();
       await workCard.click();
-      const fastReadyTimeoutMs = Math.min(options.uiTimeoutMs, 2500);
+      const fastReadyTimeoutMs = Math.min(
+        getEffectiveTimeout(options, options.uiTimeoutMs),
+        2500
+      );
       await Promise.race([
         sideSheet.waitFor({ state: "hidden", timeout: fastReadyTimeoutMs }).catch(() => null),
         page
@@ -1241,9 +1277,10 @@ async function waitForCommentsArea(page, options) {
     page.locator('[comment-item]').first(),
     page.locator('button:has-text("回复"), div:has-text("回复")').first()
   ];
+  const timeoutMs = getEffectiveTimeout(options, options.uiTimeoutMs);
   const startedAt = Date.now();
 
-  while (Date.now() - startedAt < options.uiTimeoutMs) {
+  while (Date.now() - startedAt < timeoutMs) {
     for (const locator of candidates) {
       if (await locator.isVisible().catch(() => false)) {
         return;
@@ -1254,7 +1291,7 @@ async function waitForCommentsArea(page, options) {
   }
 
   throw new Error(
-    `Timed out waiting for the comment area after ${options.uiTimeoutMs}ms. Try --ui-timeout-ms 60000.`
+    `Timed out waiting for the comment area after ${timeoutMs}ms. Try --ui-timeout-ms 60000.`
   );
 }
 
@@ -1296,10 +1333,11 @@ async function markCommentStatusFilter(page) {
 }
 
 async function waitForCommentStatusFilter(page, options) {
+  const timeoutMs = getEffectiveTimeout(options, options.uiTimeoutMs);
   const startedAt = Date.now();
   let lastLoggedAt = 0;
 
-  while (Date.now() - startedAt < options.uiTimeoutMs) {
+  while (Date.now() - startedAt < timeoutMs) {
     const filterTrigger = await markCommentStatusFilter(page);
     if (filterTrigger) {
       const currentText = normalizeText(await filterTrigger.textContent());
@@ -1335,7 +1373,7 @@ async function waitForCommentStatusFilter(page, options) {
       .slice(0, 10);
   });
   throw new Error(
-    `Timed out waiting for the comment status filter after ${options.uiTimeoutMs}ms. Visible comboboxes: ${JSON.stringify(
+    `Timed out waiting for the comment status filter after ${timeoutMs}ms. Visible comboboxes: ${JSON.stringify(
       availableComboboxes
     )}. Try --ui-timeout-ms 60000.`
   );
@@ -1382,7 +1420,10 @@ async function applyUnrepliedCommentsFilter(page, options) {
     await filterTrigger.click();
 
     const optionsLocator = page.locator(".douyin-creator-interactive-select-option");
-    await optionsLocator.first().waitFor({ state: "visible", timeout: options.uiTimeoutMs });
+    await optionsLocator.first().waitFor({
+      state: "visible",
+      timeout: getEffectiveTimeout(options, options.uiTimeoutMs)
+    });
 
     const optionCount = await optionsLocator.count();
     const optionTexts = [];
@@ -1390,7 +1431,7 @@ async function applyUnrepliedCommentsFilter(page, options) {
       optionTexts.push(normalizeText(await optionsLocator.nth(index).textContent()));
     }
     logReplyFilterDebug("comment filter dropdown options", optionTexts);
-    const refreshTimeoutMs = Math.min(options.uiTimeoutMs, 8000);
+    const refreshTimeoutMs = Math.min(getEffectiveTimeout(options, options.uiTimeoutMs), 8000);
 
     for (let index = 0; index < optionCount; index += 1) {
       const option = optionsLocator.nth(index);
@@ -2416,10 +2457,11 @@ async function inspectCommentActions(commentLocator, intendedReplyMessage = "") 
   }, intendedReplyMessage);
 }
 
-async function waitForReplySendReady(page, commentLocator, timeoutMs) {
+async function waitForReplySendReady(page, commentLocator, timeoutMs, options = null) {
+  const effectiveTimeoutMs = getEffectiveTimeout(options, timeoutMs);
   const startedAt = Date.now();
 
-  while (Date.now() - startedAt < timeoutMs) {
+  while (Date.now() - startedAt < effectiveTimeoutMs) {
     const ready = await commentLocator.evaluate((root) => {
       const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
       const sendCandidate = Array.from(root.querySelectorAll("button, div, span")).find(
@@ -2447,7 +2489,7 @@ async function waitForReplySendReady(page, commentLocator, timeoutMs) {
     await page.waitForTimeout(120);
   }
 
-  throw new Error(`Timed out waiting for the send button after ${timeoutMs}ms.`);
+  throw new Error(`Timed out waiting for the send button after ${effectiveTimeoutMs}ms.`);
 }
 
 async function safeReplyToComment(page, commentLocator, comment, options) {
@@ -2524,13 +2566,16 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
     await replyButton.click();
 
     const inputBox = commentLocator.locator('div[contenteditable="true"]').last();
-    await inputBox.waitFor({ state: "visible", timeout: options.replyTimeoutMs });
+    await inputBox.waitFor({
+      state: "visible",
+      timeout: getEffectiveTimeout(options, options.replyTimeoutMs)
+    });
     await inputBox.click();
     await inputBox.type(options.replyMessage, {
       delay: options.replyTypeDelayMs
     });
 
-    await waitForReplySendReady(page, commentLocator, options.replyTimeoutMs);
+    await waitForReplySendReady(page, commentLocator, options.replyTimeoutMs, options);
 
     const sendButton = commentLocator.getByText("发送", { exact: true }).first();
     await sendButton.click();
@@ -2553,6 +2598,7 @@ async function replyToComments(page, options) {
   await applyUnrepliedCommentsFilter(page, options);
 
   const scrollContainer = await markCommentScrollContainer(page);
+  const timeoutMs = getEffectiveTimeout(options, options.timeoutMs);
   const startedAt = Date.now();
   const processedSignatures = new Set();
   const processedPlanIds = new Set();
@@ -2560,7 +2606,7 @@ async function replyToComments(page, options) {
   let repliedCount = 0;
   let lastProgressAt = startedAt;
 
-  while (Date.now() - startedAt < options.timeoutMs) {
+  while (Date.now() - startedAt < timeoutMs) {
     if (Array.isArray(options.replyPlans) && processedPlanIds.size >= options.replyPlans.length) {
       break;
     }
@@ -2724,11 +2770,12 @@ async function collectComments(page, options) {
 
   const scrollContainer = await markCommentScrollContainer(page);
   const commentsBySignature = new Map();
+  const timeoutMs = getEffectiveTimeout(options, options.timeoutMs);
   const startedAt = Date.now();
   let lastProgressAt = startedAt;
   let stalledScrollAttempts = 0;
 
-  while (Date.now() - startedAt < options.timeoutMs) {
+  while (Date.now() - startedAt < timeoutMs) {
     if (options.expandReplies) {
       await expandReplyThreads(page);
     }
@@ -2812,11 +2859,21 @@ async function main() {
     : [];
   const isReplyMode = Boolean(args.replyMessage || args.replyPlanFile || args.replyDryRun);
   const replyHistory = isReplyMode ? await loadReplyHistory() : null;
+  const runtimeBudget = args.maxRuntimeMs
+    ? {
+        deadline: Date.now() + args.maxRuntimeMs,
+        maxRuntimeMs: args.maxRuntimeMs
+      }
+    : {
+        deadline: null,
+        maxRuntimeMs: 0
+      };
 
   logReplyFilterDebug("startup", {
     listWorks: args.listWorks,
     workId: args.workId || null,
     workTitle: args.workTitle || null,
+    maxRuntimeMs: args.maxRuntimeMs || null,
     unrepliedOnly: args.unrepliedOnly,
     isReplyMode,
     replyPlanMode: Boolean(args.replyPlanFile),
@@ -2830,14 +2887,19 @@ async function main() {
   });
 
   const page = context.pages()[0] ?? (await context.newPage());
-  context.setDefaultTimeout(args.uiTimeoutMs);
-  context.setDefaultNavigationTimeout(args.navigationTimeoutMs);
-  page.setDefaultTimeout(args.uiTimeoutMs);
-  page.setDefaultNavigationTimeout(args.navigationTimeoutMs);
+  context.setDefaultTimeout(getEffectiveTimeout(runtimeBudget, args.uiTimeoutMs));
+  context.setDefaultNavigationTimeout(
+    getEffectiveTimeout(runtimeBudget, args.navigationTimeoutMs)
+  );
+  page.setDefaultTimeout(getEffectiveTimeout(runtimeBudget, args.uiTimeoutMs));
+  page.setDefaultNavigationTimeout(
+    getEffectiveTimeout(runtimeBudget, args.navigationTimeoutMs)
+  );
   const workCollector = createWorkCollector(page);
 
   try {
     await ensureCommentPageReady(page, args.pageUrl, {
+      ...runtimeBudget,
       navigationTimeoutMs: args.navigationTimeoutMs,
       uiTimeoutMs: args.uiTimeoutMs
     });
@@ -2847,6 +2909,7 @@ async function main() {
 
     if (args.listWorks) {
       works = await fetchAllWorksWithRetry(page, workCollector, {
+        ...runtimeBudget,
         timeoutMs: args.worksTimeoutMs,
         idleMs: args.worksIdleMs,
         uiTimeoutMs: args.uiTimeoutMs
@@ -2867,6 +2930,7 @@ async function main() {
 
     if (args.workId || args.workTitle) {
       targetWork = await findTargetWorkWithRetry(page, workCollector, {
+        ...runtimeBudget,
         workId: args.workId,
         workTitle: args.workTitle,
         timeoutMs: args.worksTimeoutMs,
@@ -2879,6 +2943,7 @@ async function main() {
     if (targetWork) {
       logReplyFilterDebug("selecting target work", getSelectedWorkOutput(targetWork));
       await selectWorkFromSideSheet(page, targetWork, {
+        ...runtimeBudget,
         timeoutMs: args.worksTimeoutMs,
         uiTimeoutMs: args.uiTimeoutMs
       });
@@ -2892,6 +2957,7 @@ async function main() {
         replyLimit: args.replyLimit
       });
       const replySummary = await replyToComments(page, {
+        ...runtimeBudget,
         replyMessage: args.replyMessage,
         replyPlans,
         replyPlanMode: Boolean(args.replyPlanFile),
@@ -2913,6 +2979,7 @@ async function main() {
           mode: "reply",
           pageUrl: args.pageUrl,
           selectedWork: getSelectedWorkOutput(targetWork),
+          timeoutMs: args.maxRuntimeMs || null,
           replyMessage: args.replyMessage,
           replyPlanFile: args.replyPlanFile || null,
           replyDryRun: args.replyDryRun,
@@ -2926,6 +2993,7 @@ async function main() {
     }
 
     const comments = await collectComments(page, {
+      ...runtimeBudget,
       limit: args.limit,
       unrepliedOnly: args.unrepliedOnly,
       expandReplies: args.expandReplies,
@@ -2939,6 +3007,7 @@ async function main() {
         fetchedAt: new Date().toISOString(),
         pageUrl: args.pageUrl,
         selectedWork: getSelectedWorkOutput(targetWork),
+        timeoutMs: args.maxRuntimeMs || null,
         commentFilter: args.unrepliedOnly ? "unreplied" : "all",
         count: comments.length,
         comments

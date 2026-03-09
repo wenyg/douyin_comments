@@ -65,6 +65,7 @@ npm run comments -- \
 - `--list-works`：只拉取并输出作品列表
 - `--work-id <id>`：按作品 `item_id` 选择
 - `--work-title <title>`：按标题选择，优先精确匹配
+- `--timeout-ms <ms>`：整次运行的最大总时长；如果设置了，其他步骤只会消耗剩余时间
 - `--unreplied-only`：只导出“未回复”评论，不发送回复
 - `--reply-message <text>`：开启回复模式，按给定文案回复未回复评论
 - `--reply-plan-file <path>`：按 JSON 文件中的匹配规则，给特定评论回复指定文案
