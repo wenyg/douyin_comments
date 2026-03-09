@@ -65,8 +65,10 @@ npm run comments -- \
 - `--list-works`：只拉取并输出作品列表
 - `--work-id <id>`：按作品 `item_id` 选择
 - `--work-title <title>`：按标题选择，优先精确匹配
+- `--unreplied-only`：只导出“未回复”评论，不发送回复
 - `--reply-message <text>`：开启回复模式，按给定文案回复未回复评论
 - `--reply-plan-file <path>`：按 JSON 文件中的匹配规则，给特定评论回复指定文案
+- `--reply-dry-run`：进入回复模式并强制切到“未回复”，但在真正发送前停止，便于排查流程
 - `--reply-limit <n>`：最多发送多少条回复，默认 `20`
 - `--reply-timeout-ms <ms>`：单条回复流程最大等待时间，默认 `30000`
 - `--reply-settle-ms <ms>`：发送后等待页面刷新，默认 `1800`
@@ -91,7 +93,8 @@ npm run comments -- \
 - 如果网络慢，`--list-works` 会先等待接口响应；接口仍未命中时，再用侧边栏 DOM 做标题级兜底，不再直接空退出。
 - 按 `--work-id` 或 `--work-title` 抓评论时，脚本会在匹配到目标作品后提前停止滚动，不再遍历完整个作品列表。
 - 作品选择现在优先按标题精确匹配；如果同标题作品无法用发布时间区分，脚本会直接报歧义，建议改用 `--work-id`。
-- 回复模式会先检查当前评论是否已经存在“作者”回复；如果存在则跳过，避免重复回复。
+- 回复模式会强制先切换到页面原生的“未回复”过滤；如果过滤控件不可用、找不到“未回复”选项或切换失败，脚本会直接报错退出，不再降级继续回复。
+- `--unreplied-only` 会走同一套“未回复”过滤逻辑，但只导出评论 JSON，不执行回复动作。
 - 回复模式还会把已成功发送过的“作品 + 评论 + 回复文案”记录到 `.playwright/reply-history.json`，脚本重复执行时会优先跳过这些已发记录。
 - `--reply-plan-file` 支持为每条目标评论单独指定 `replyMessage`；示例格式见 [reply-plan.example.json](/Users/yangguang.wen/douyin_plugin_back/reply-plan.example.json)。
 - `reply-plan-file` 中 `commentText` 必填，`username` 和 `publishText` 选填；填得越全，定向匹配越稳。

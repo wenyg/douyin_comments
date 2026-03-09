@@ -20,8 +20,10 @@ Options:
   --list-works              Fetch and print all works from the side sheet
   --work-id <item_id>       Select a work by item_id
   --work-title <title>      Select a work by title
+  --unreplied-only          Collect only unreplied comments without sending replies
   --reply-message <text>    Reply to unreplied comments with the given text
   --reply-plan-file <path>  Reply to specific comments from a JSON plan file
+  --reply-dry-run           Enter reply mode but stop before sending any reply
   --reply-limit <n>         Max number of replies to send (default: 20)
   --reply-timeout-ms <ms>   Max wait for one reply flow (default: 30000)
   --reply-settle-ms <ms>    Wait after sending one reply (default: 1800)
@@ -62,8 +64,10 @@ function parseArgs(argv) {
     output: "",
     workId: "",
     workTitle: "",
+    unrepliedOnly: false,
     replyMessage: "",
     replyPlanFile: "",
+    replyDryRun: false,
     replyLimit: 20,
     replyTimeoutMs: 30000,
     replySettleMs: 1800,
@@ -98,6 +102,9 @@ function parseArgs(argv) {
         args.workTitle = normalizeText(argv[index + 1] ?? "");
         index += 1;
         break;
+      case "--unreplied-only":
+        args.unrepliedOnly = true;
+        break;
       case "--reply-message":
         args.replyMessage = String(argv[index + 1] ?? "").trim();
         index += 1;
@@ -105,6 +112,9 @@ function parseArgs(argv) {
       case "--reply-plan-file":
         args.replyPlanFile = path.resolve(argv[index + 1] ?? "");
         index += 1;
+        break;
+      case "--reply-dry-run":
+        args.replyDryRun = true;
         break;
       case "--reply-limit":
         args.replyLimit = toPositiveInteger(argv[index + 1], "--reply-limit");
@@ -207,6 +217,17 @@ function formatUnixSeconds(rawValue) {
 
 function normalizeLookupText(value = "") {
   return normalizeText(value).toLowerCase();
+}
+
+function logReplyFilterDebug(message, details = null) {
+  if (details === null || details === undefined) {
+    console.error(`[reply-filter] ${message}`);
+    return;
+  }
+
+  const suffix =
+    typeof details === "string" ? details : JSON.stringify(details, null, 2);
+  console.error(`[reply-filter] ${message}: ${suffix}`);
 }
 
 function getCommentSignature(comment) {
@@ -1164,6 +1185,209 @@ async function waitForCommentsArea(page, options) {
   throw new Error(
     `Timed out waiting for the comment area after ${options.uiTimeoutMs}ms. Try --ui-timeout-ms 60000.`
   );
+}
+
+async function markCommentStatusFilter(page) {
+  const marked = await page.evaluate(() => {
+    const marker = "data-codex-comment-status-filter";
+    const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
+    const knownFilterLabels = new Set(["全部评论", "未回复", "已回复"]);
+
+    for (const element of document.querySelectorAll(`[${marker}]`)) {
+      element.removeAttribute(marker);
+    }
+
+    const candidates = Array.from(
+      document.querySelectorAll('[role="combobox"].douyin-creator-interactive-select')
+    ).filter((node) => node instanceof HTMLElement);
+
+    const target =
+      candidates.find((node) => {
+        const text = normalize(node.innerText || node.textContent || "");
+        return knownFilterLabels.has(text);
+      }) ??
+      candidates.find((node) => {
+        const text = normalize(node.innerText || node.textContent || "");
+        return (
+          text.includes("全部评论") || text.includes("未回复") || text.includes("已回复")
+        );
+      });
+
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+
+    target.setAttribute(marker, "true");
+    return true;
+  });
+
+  return marked ? page.locator('[data-codex-comment-status-filter="true"]').first() : null;
+}
+
+async function waitForCommentStatusFilter(page, options) {
+  const startedAt = Date.now();
+  let lastLoggedAt = 0;
+
+  while (Date.now() - startedAt < options.uiTimeoutMs) {
+    const filterTrigger = await markCommentStatusFilter(page);
+    if (filterTrigger) {
+      const currentText = normalizeText(await filterTrigger.textContent());
+      logReplyFilterDebug("found comment status filter", { text: currentText });
+      return filterTrigger;
+    }
+
+    if (Date.now() - lastLoggedAt >= 1000) {
+      const availableComboboxes = await page.evaluate(() => {
+        const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
+        return Array.from(document.querySelectorAll("[role=\"combobox\"]"))
+          .filter((node) => node instanceof HTMLElement)
+          .map((node) => normalize(node.innerText || node.textContent || ""))
+          .filter(Boolean)
+          .slice(0, 10);
+      });
+      logReplyFilterDebug("waiting for comment status filter", {
+        elapsedMs: Date.now() - startedAt,
+        availableComboboxes
+      });
+      lastLoggedAt = Date.now();
+    }
+
+    await page.waitForTimeout(200);
+  }
+
+  const availableComboboxes = await page.evaluate(() => {
+    const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
+    return Array.from(document.querySelectorAll("[role=\"combobox\"]"))
+      .filter((node) => node instanceof HTMLElement)
+      .map((node) => normalize(node.innerText || node.textContent || ""))
+      .filter(Boolean)
+      .slice(0, 10);
+  });
+  throw new Error(
+    `Timed out waiting for the comment status filter after ${options.uiTimeoutMs}ms. Visible comboboxes: ${JSON.stringify(
+      availableComboboxes
+    )}. Try --ui-timeout-ms 60000.`
+  );
+}
+
+async function captureCommentListFingerprint(page) {
+  return page.evaluate(() => {
+    const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
+
+    return Array.from(document.querySelectorAll("[comment-item], div.container-sXKyMs"))
+      .filter((node) => node instanceof HTMLElement)
+      .slice(0, 5)
+      .map((node) => normalize((node.innerText || node.textContent || "").slice(0, 160)))
+      .filter(Boolean)
+      .join("||");
+  });
+}
+
+async function applyUnrepliedCommentsFilter(page, options) {
+  const filterTrigger = await waitForCommentStatusFilter(page, options);
+
+  try {
+    await filterTrigger.scrollIntoViewIfNeeded().catch(() => {});
+    const currentText = normalizeText(await filterTrigger.textContent());
+    logReplyFilterDebug("current comment filter text", currentText);
+    if (currentText.includes("未回复")) {
+      logReplyFilterDebug("comment filter already set to unreplied");
+      return {
+        applied: true,
+        reason: "already_selected"
+      };
+    }
+
+    const previousFingerprint = await captureCommentListFingerprint(page);
+    await filterTrigger.click();
+
+    const optionsLocator = page.locator(".douyin-creator-interactive-select-option");
+    await optionsLocator.first().waitFor({ state: "visible", timeout: options.uiTimeoutMs });
+
+    const optionCount = await optionsLocator.count();
+    const optionTexts = [];
+    for (let index = 0; index < optionCount; index += 1) {
+      optionTexts.push(normalizeText(await optionsLocator.nth(index).textContent()));
+    }
+    logReplyFilterDebug("comment filter dropdown options", optionTexts);
+    const refreshTimeoutMs = Math.min(options.uiTimeoutMs, 8000);
+
+    for (let index = 0; index < optionCount; index += 1) {
+      const option = optionsLocator.nth(index);
+      const text = optionTexts[index];
+      if (text !== "未回复") {
+        continue;
+      }
+
+      const responseWait = page
+        .waitForResponse(
+          (response) =>
+            response.request().method() === "GET" &&
+            response.ok() &&
+            response.url().includes("/aweme/v1/web/comment/list/select/"),
+          { timeout: refreshTimeoutMs }
+        )
+        .then(() => true)
+        .catch(() => false);
+
+      const domWait = page
+        .waitForFunction(
+          (fingerprint) => {
+            const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
+            const filterSelected = Array.from(
+              document.querySelectorAll('div[role="combobox"].douyin-creator-interactive-select')
+            ).some((node) =>
+              normalize(node.innerText || node.textContent || "").includes("未回复")
+            );
+
+            if (!filterSelected) {
+              return false;
+            }
+
+            const currentFingerprint = Array.from(
+              document.querySelectorAll("[comment-item], div.container-sXKyMs")
+            )
+              .filter((node) => node instanceof HTMLElement)
+              .slice(0, 5)
+              .map((node) => normalize((node.innerText || node.textContent || "").slice(0, 160)))
+              .filter(Boolean)
+              .join("||");
+
+            return currentFingerprint !== fingerprint || currentFingerprint.length === 0;
+          },
+          previousFingerprint,
+          { timeout: refreshTimeoutMs }
+        )
+        .then(() => true)
+        .catch(() => false);
+
+      await option.click();
+      const [responseSeen, domUpdated] = await Promise.all([responseWait, domWait]);
+      logReplyFilterDebug("applied unreplied filter", {
+        responseSeen,
+        domUpdated
+      });
+
+      if (!responseSeen && !domUpdated) {
+        await page.waitForTimeout(1000);
+      } else {
+        await page.waitForTimeout(350);
+      }
+
+      return {
+        applied: true,
+        reason: "selected"
+      };
+    }
+
+    await page.keyboard.press("Escape").catch(() => {});
+    throw new Error("评论状态过滤下拉框中未找到“未回复”选项。");
+  } catch (error) {
+    await page.keyboard.press("Escape").catch(() => {});
+    throw new Error(
+      `切换“未回复”过滤失败: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 async function markCommentScrollContainer(page) {
@@ -2189,7 +2413,7 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
 }
 
 async function replyToComments(page, options) {
-  await waitForCommentsArea(page, options);
+  await applyUnrepliedCommentsFilter(page, options);
 
   const scrollContainer = await markCommentScrollContainer(page);
   const startedAt = Date.now();
@@ -2214,6 +2438,23 @@ async function replyToComments(page, options) {
 
     if (nextTarget) {
       const { comment: nextComment, plan, replyMessage } = nextTarget;
+      if (options.replyDryRun) {
+        processedSignatures.add(nextComment.signature);
+        if (plan) {
+          processedPlanIds.add(plan.id);
+        }
+        results.push({
+          username: nextComment.username,
+          commentText: nextComment.commentText,
+          publishText: nextComment.publishText,
+          status: "dry_run_target_found",
+          replyPlanId: plan?.id ?? null,
+          requestedReplyMessage: replyMessage
+        });
+        lastProgressAt = Date.now();
+        break;
+      }
+
       const duplicateHistoryEntry = findReplyHistoryEntry(
         options.replyHistory,
         options.selectedWork,
@@ -2346,6 +2587,11 @@ async function replyToComments(page, options) {
 }
 
 async function collectComments(page, options) {
+  if (options.unrepliedOnly) {
+    logReplyFilterDebug("entering unreplied collection flow");
+    await applyUnrepliedCommentsFilter(page, options);
+  }
+
   await waitForCommentsArea(page, options);
 
   const scrollContainer = await markCommentScrollContainer(page);
@@ -2450,8 +2696,19 @@ async function main() {
   const replyPlans = args.replyPlanFile
     ? await loadReplyPlan(args.replyPlanFile, args.replyMessage)
     : [];
-  const isReplyMode = Boolean(args.replyMessage || args.replyPlanFile);
+  const isReplyMode = Boolean(args.replyMessage || args.replyPlanFile || args.replyDryRun);
   const replyHistory = isReplyMode ? await loadReplyHistory() : null;
+
+  logReplyFilterDebug("startup", {
+    listWorks: args.listWorks,
+    workId: args.workId || null,
+    workTitle: args.workTitle || null,
+    unrepliedOnly: args.unrepliedOnly,
+    isReplyMode,
+    replyPlanMode: Boolean(args.replyPlanFile),
+    replyDryRun: args.replyDryRun,
+    headless: args.headless
+  });
 
   const context = await chromium.launchPersistentContext(args.userDataDir, {
     headless: args.headless,
@@ -2502,20 +2759,29 @@ async function main() {
         idleMs: args.worksIdleMs,
         uiTimeoutMs: args.uiTimeoutMs
       });
+      logReplyFilterDebug("resolved target work", getSelectedWorkOutput(targetWork));
     }
 
     if (targetWork) {
+      logReplyFilterDebug("selecting target work", getSelectedWorkOutput(targetWork));
       await selectWorkFromSideSheet(page, targetWork, {
         timeoutMs: args.worksTimeoutMs,
         uiTimeoutMs: args.uiTimeoutMs
       });
+      logReplyFilterDebug("selected target work", getSelectedWorkOutput(targetWork));
     }
 
     if (isReplyMode) {
+      logReplyFilterDebug("entering reply flow", {
+        selectedWork: getSelectedWorkOutput(targetWork),
+        replyPlanCount: replyPlans.length,
+        replyLimit: args.replyLimit
+      });
       const replySummary = await replyToComments(page, {
         replyMessage: args.replyMessage,
         replyPlans,
         replyPlanMode: Boolean(args.replyPlanFile),
+        replyDryRun: args.replyDryRun,
         replyHistory,
         selectedWork: targetWork,
         replyLimit: args.replyLimit,
@@ -2535,6 +2801,7 @@ async function main() {
           selectedWork: getSelectedWorkOutput(targetWork),
           replyMessage: args.replyMessage,
           replyPlanFile: args.replyPlanFile || null,
+          replyDryRun: args.replyDryRun,
           replyHistoryFile: replyHistory?.filePath ?? null,
           replyLimit: args.replyLimit,
           ...replySummary
@@ -2546,6 +2813,7 @@ async function main() {
 
     const comments = await collectComments(page, {
       limit: args.limit,
+      unrepliedOnly: args.unrepliedOnly,
       expandReplies: args.expandReplies,
       timeoutMs: args.commentsTimeoutMs,
       idleMs: args.commentsIdleMs,
@@ -2557,6 +2825,7 @@ async function main() {
         fetchedAt: new Date().toISOString(),
         pageUrl: args.pageUrl,
         selectedWork: getSelectedWorkOutput(targetWork),
+        commentFilter: args.unrepliedOnly ? "unreplied" : "all",
         count: comments.length,
         comments
       },

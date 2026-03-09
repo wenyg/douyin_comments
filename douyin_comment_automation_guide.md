@@ -27,8 +27,19 @@
             *   利用这些 ID 映射（犹如数据库表的外键关联），你可以零误差地梳理出每一套对话层的父子树形结构。
     7.  一旦遇到“收起”按钮或下一个 `X` 坐标恢复到 210px 主级别的评论区块，当前父评论的收集链彻底结束。
 
-### 2. 防止重复回复检测逻辑（最关键）
-在遍历评论并执行回复前，必须判断该评论是否已经被作者本人回复过，以免由于 DOM 刷新引发的重复发送或死循环。
+### 2. 快速过滤“未回复”评论（官方原生功能，强烈建议首选）
+在遍历与回复之前，最高效的防重复回复策略是利用页面自带的过滤功能，直接选用**“未回复”**状态，从而在源头剔除已处理过的评论。
+
+*   **定位过滤下拉框（触发器）**
+    *   **选择器**：`div[role="combobox"].douyin-creator-interactive-select`
+    *   **特征**：初始文本为“全部评论”。该组件存在交互状态对应的 class，使用基础 role 和 class 定位最为稳定。
+*   **点击展开并选择“未回复”**
+    *   **选项选择器**：`.douyin-creator-interactive-select-option`
+    *   **逻辑**：点击下拉框后，下拉面板通常挂载在页面的 Portal 中（如 body 末尾）。由于其内部 ID 是动态的（如 `zr32inh`），切记**不可按 ID 寻找**。需要获取所有下拉选项，并基于文本内容 `textContent.trim() === '未回复'` 进行精准点击。
+    *   **等待 DOM 刷新**：选中后列表会自动刷新，只展现未回复的数据。代码最好等待相应的网络接口完成响应或列表更新。
+
+### 3. DOM层级的防重复回复检测（单条评论内部辅助/兜底）
+即使使用了列表过滤，某些特定场景（如单条处理的二次校验）下仍需判断当前评论是否已被回复过。
 
 由于作者的回复是被折叠收纳在主评论的【子评论区域】中的，必须执行深层检测：
 *   **第一层：检测是否存在子评论展开按钮**
@@ -42,7 +53,7 @@
     *   **选择器**：`span:has-text("作者")`。
     *   **结论**：如果能在展开的子级中找到“作者”标签，说明你已回复，可以直接跳过此条评论；如果没有，则说明下面只是其他粉丝的互动，你仍然需要执行回复。
 
-### 3. 回复指定评论流程
+### 4. 回复指定评论流程
 确认需要回复后，执行以下步骤与页面结构交互：
 *   **点击原始“回复”按钮**
     *   **选择器**：在当前评论块内寻找 `button:has-text("回复")` 或者相应的可点击区域并 Click。
@@ -58,7 +69,7 @@
 *   **等待 DOM 刷新**
     *   发送按钮点击后，一定要显式等待（Sleep 1.5s~2s左右），这是为了等待接口返回及页面将你刚刚发出的气泡作为子 DOM 插入到列表里。如果不等待直接进行下一条，由于重排可能导致下一个元素的 Locator 定位失效。
 
-### 4. 获取与切换作品列表
+### 5. 获取与切换作品列表
 要专项管理特定视频下的评论或获取账号下所有作品的 ID 映射，需要操作页面右上方的“选择作品”侧边栏。
 
 *   **打开作品侧边栏**
@@ -124,7 +135,37 @@ async function fetchAllWorks(page) {
 }
 ```
 
-### 示例 2: 处理单条评论防重复回复与安全点击流程
+### 示例 2: 切换到"未回复"评论过滤视图
+
+利用此范例可以在执行具体的评论遍历操作前，先把页面上的无用已回复评论剔除。
+
+```javascript
+async function filterUnrepliedComments(page) {
+  // 1. 定位并点击“全部评论”所在的下拉框触发器
+  const dropdownTrigger = page.locator('div[role="combobox"].douyin-creator-interactive-select');
+  await dropdownTrigger.click();
+
+  // 2. 显式等待下拉面板选项渲染出来（面板通常位于 Portal 即外层 body 中）
+  await page.waitForSelector('.douyin-creator-interactive-select-option');
+  
+  // 3. 遍历列表，精确寻找文本包含“未回复”的选项并点击
+  const options = page.locator('.douyin-creator-interactive-select-option');
+  const count = await options.count();
+  for (let i = 0; i < count; i++) {
+    const text = await options.nth(i).textContent();
+    if (text && text.trim() === '未回复') {
+      await options.nth(i).click();
+      break;
+    }
+  }
+
+  // 4. 选择后，等待评论列表的网络更新或 DOM 重绘
+  // await page.waitForResponse(res => res.url().includes('comment/list'));
+  await page.waitForTimeout(1000); 
+}
+```
+
+### 示例 3: 处理单条评论防重复回复与安全点击流程
 
 以下示例代码演示了在处理每一个独立的评论区块时，应当如何串起上述状态校验与动作链路：
 
