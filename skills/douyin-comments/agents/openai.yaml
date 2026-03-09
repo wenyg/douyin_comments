@@ -1,0 +1,7 @@
+interface:
+  display_name: "Douyin Comments"
+  short_description: "List works, export unreplied comments, and reply from JSON."
+  default_prompt: "Use $douyin-comments to operate the Douyin comment project in this skill directory."
+
+policy:
+  allow_implicit_invocation: true

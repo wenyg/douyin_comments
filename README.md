@@ -46,18 +46,6 @@ npm run comments -- \
   --limit 500 \
   --output comments-output/unreplied-comments.json
 ```
-
-按 `item_id`：
-
-```bash
-npm run comments -- \
-  --unreplied-only \
-  --work-id 1234567890123456789 \
-  --timeout-ms 120000 \
-  --limit 500 \
-  --output comments-output/unreplied-comments.json
-```
-
 输出格式：
 
 ```json
@@ -102,6 +90,5 @@ npm run comments -- \
 ## 说明
 
 - 登录态依赖抖音创作者中心页面，脚本不会绕过登录或验证码。
-- 作品列表优先通过拦截 `/aweme/v1/creator/item/list/` 响应获取；接口未命中时，再用侧边栏 DOM 兜底。
 - 获取未回复评论和回复评论都会强制切到页面原生“未回复”过滤；如果过滤控件不可用、找不到“未回复”选项或切换失败，脚本会直接报错退出。
 - 回复成功记录会写入 `.playwright/reply-history.json`，重复执行时会优先跳过已发过的“作品 + 评论 + 回复文案”组合。
