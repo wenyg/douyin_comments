@@ -10,6 +10,11 @@ const DEFAULT_COMMENT_PAGE_URL =
   "https://creator.douyin.com/creator-micro/interactive/comment";
 const DEFAULT_USER_DATA_DIR = path.resolve(".playwright/douyin-profile");
 const DEFAULT_REPLY_HISTORY_FILE = path.resolve(".playwright/reply-history.json");
+const DEFAULT_COMMENTS_TIMEOUT_MS = 300000;
+const DEFAULT_REPLY_FLOW_TIMEOUT_MS = 1800000;
+const REPLY_FLOW_TIMEOUT_BUFFER_MS = 60000;
+const REPLY_FLOW_TIMEOUT_PER_PLAN_MS = 20000;
+const MAX_AUTO_REPLY_FLOW_TIMEOUT_MS = 7200000;
 
 function printHelp() {
   console.log(`
@@ -28,6 +33,7 @@ Work Selectors:
 Shared Options:
   --timeout-ms <ms>           Max total runtime for the whole command
   --reply-limit <n>           Max number of replies to send (default: 20)
+  --dry-run                   Type one reply into the input box but do not send it
   --reply-timeout-ms <ms>     Max wait for one reply flow (default: 30000)
   --reply-settle-ms <ms>      Wait after sending one reply (default: 1800)
   --reply-type-delay-ms <ms>  Delay between typed chars (default: 100)
@@ -36,7 +42,7 @@ Shared Options:
   --ui-timeout-ms <ms>        Max wait for key page elements to appear (default: 30000)
   --works-timeout-ms <ms>     Max wait for the works list to appear (default: 45000)
   --works-idle-ms <ms>        Works list idle window before stopping (default: 5000)
-  --comments-timeout-ms <ms>  Max wait for unreplied comment collection / reply flow (default: 90000)
+  --comments-timeout-ms <ms>  Max wait for unreplied comment collection / reply flow (collect default: ${DEFAULT_COMMENTS_TIMEOUT_MS}; reply auto-scales unless explicitly set)
   --comments-idle-ms <ms>     Comment idle window before stopping (default: 5000)
   --output <path>             Write JSON result to a file
   --headless                  Run Chromium in headless mode
@@ -50,12 +56,49 @@ function normalizeText(value = "") {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function normalizeUsername(value = "") {
+  return normalizeText(value).replace(/\s+/g, "");
+}
+
 function toPositiveInteger(rawValue, flagName) {
   const value = Number.parseInt(rawValue, 10);
   if (!Number.isInteger(value) || value <= 0) {
     throw new Error(`${flagName} expects a positive integer, received: ${rawValue}`);
   }
   return value;
+}
+
+function resolveReplyFlowTimeoutConfig(args, replyPlanCount) {
+  if (args.commentsTimeoutExplicit) {
+    return {
+      timeoutMs: args.commentsTimeoutMs,
+      source: "explicit_comments_timeout",
+      targetReplyCount: Math.max(
+        1,
+        Math.min(args.replyLimit || replyPlanCount || 1, replyPlanCount || args.replyLimit || 1)
+      ),
+      estimatedTimeoutMs: args.commentsTimeoutMs
+    };
+  }
+
+  const targetReplyCount = Math.max(
+    1,
+    Math.min(args.replyLimit || replyPlanCount || 1, replyPlanCount || args.replyLimit || 1)
+  );
+  const estimatedTimeoutMs = Math.min(
+    MAX_AUTO_REPLY_FLOW_TIMEOUT_MS,
+    Math.max(
+      DEFAULT_REPLY_FLOW_TIMEOUT_MS,
+      REPLY_FLOW_TIMEOUT_BUFFER_MS + targetReplyCount * REPLY_FLOW_TIMEOUT_PER_PLAN_MS
+    )
+  );
+
+  return {
+    timeoutMs: estimatedTimeoutMs,
+    source: "auto_reply_flow_timeout",
+    targetReplyCount,
+    estimatedTimeoutMs
+  };
 }
 
 function parseArgs(argv) {
@@ -69,6 +112,7 @@ function parseArgs(argv) {
     unrepliedOnly: false,
     replyCommentsFile: "",
     replyLimit: 20,
+    replyDryRun: false,
     replyTimeoutMs: 30000,
     replySettleMs: 1800,
     replyTypeDelayMs: 100,
@@ -78,7 +122,8 @@ function parseArgs(argv) {
     uiTimeoutMs: 30000,
     worksTimeoutMs: 45000,
     worksIdleMs: 5000,
-    commentsTimeoutMs: 90000,
+    commentsTimeoutMs: DEFAULT_COMMENTS_TIMEOUT_MS,
+    commentsTimeoutExplicit: false,
     commentsIdleMs: 5000,
     headless: false
   };
@@ -115,6 +160,10 @@ function parseArgs(argv) {
       case "--reply-limit":
         args.replyLimit = toPositiveInteger(argv[index + 1], "--reply-limit");
         index += 1;
+        break;
+      case "--dry-run":
+      case "--reply-dry-run":
+        args.replyDryRun = true;
         break;
       case "--reply-timeout-ms":
         args.replyTimeoutMs = toPositiveInteger(argv[index + 1], "--reply-timeout-ms");
@@ -156,6 +205,7 @@ function parseArgs(argv) {
           argv[index + 1],
           "--comments-timeout-ms"
         );
+        args.commentsTimeoutExplicit = true;
         index += 1;
         break;
       case "--comments-idle-ms":
@@ -251,7 +301,7 @@ function getCommentSignature(comment) {
   }
 
   return [
-    normalizeText(comment?.username ?? ""),
+    normalizeUsername(comment?.username ?? ""),
     normalizeText(comment?.commentText ?? ""),
     normalizeText(comment?.publishText ?? "")
   ].join("|");
@@ -371,15 +421,29 @@ async function loadReplyHistory(filePath = DEFAULT_REPLY_HISTORY_FILE) {
     const entries = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.entries) ? parsed.entries : [];
     const normalizedEntries = entries
       .filter((entry) => entry && typeof entry === "object")
-      .map((entry) => ({
-        key: String(entry.key ?? ""),
-        selectedWork: entry.selectedWork ?? null,
-        username: normalizeText(String(entry.username ?? "")),
-        commentText: normalizeText(String(entry.commentText ?? "")),
-        publishText: normalizeText(String(entry.publishText ?? "")),
-        replyMessage: String(entry.replyMessage ?? "").trim(),
-        repliedAt: String(entry.repliedAt ?? "")
-      }))
+      .map((entry) => {
+        const selectedWork = entry.selectedWork ?? null;
+        const username = normalizeUsername(String(entry.username ?? ""));
+        const commentText = normalizeText(String(entry.commentText ?? ""));
+        const publishText = normalizeText(String(entry.publishText ?? ""));
+        const replyMessage = String(entry.replyMessage ?? "").trim();
+        const normalizedEntry = {
+          selectedWork,
+          username,
+          commentText,
+          publishText,
+          replyMessage,
+          repliedAt: String(entry.repliedAt ?? "")
+        };
+
+        return {
+          key:
+            replyMessage && (selectedWork || username || commentText || publishText)
+              ? getReplyHistoryKey(selectedWork, normalizedEntry, replyMessage)
+              : String(entry.key ?? ""),
+          ...normalizedEntry
+        };
+      })
       .filter((entry) => entry.key && entry.replyMessage);
 
     return {
@@ -445,7 +509,7 @@ async function recordReplyHistory(history, selectedWork, comment, replyMessage) 
           publishText: selectedWork.publishText
         }
       : null,
-    username: normalizeText(comment.username ?? ""),
+    username: normalizeUsername(comment.username ?? ""),
     commentText: normalizeText(comment.commentText ?? ""),
     publishText: normalizeText(comment.publishText ?? ""),
     replyMessage,
@@ -483,7 +547,7 @@ function normalizeReplyCommentsFileEntry(rawEntry, index) {
     throw new Error(`reply comments item ${index + 1} must be an object`);
   }
 
-  const username = normalizeText(String(rawEntry.username ?? ""));
+  const username = normalizeUsername(String(rawEntry.username ?? ""));
   const commentText = normalizeText(
     String(rawEntry.commentText ?? rawEntry.comment ?? rawEntry.text ?? "")
   );
@@ -1572,11 +1636,59 @@ async function markCommentScrollContainer(page) {
   return page.locator('[data-codex-comment-scroll="true"]').first();
 }
 
-async function advanceCommentScroll(page, scrollContainer) {
-  const containerState = await scrollContainer.evaluate((element) => {
+async function resetCommentScrollToTop(page, scrollContainer) {
+  await scrollContainer
+    .evaluate((element) => {
+      element.scrollTop = 0;
+    })
+    .catch(() => {});
+
+  await page
+    .evaluate(() => {
+      const element =
+        document.scrollingElement instanceof HTMLElement
+          ? document.scrollingElement
+          : document.documentElement;
+      element.scrollTop = 0;
+    })
+    .catch(() => {});
+
+  await page.waitForTimeout(180);
+}
+
+async function advanceCommentScroll(page, scrollContainer, options = {}) {
+  const distanceMultiplier =
+    Number.isFinite(options.distanceMultiplier) && options.distanceMultiplier > 0
+      ? options.distanceMultiplier
+      : 0.9;
+  const minDistancePx =
+    Number.isFinite(options.minDistancePx) && options.minDistancePx > 0
+      ? options.minDistancePx
+      : 900;
+  const wheelDeltaY =
+    Number.isFinite(options.wheelDeltaY) && options.wheelDeltaY > 0
+      ? options.wheelDeltaY
+      : 1400;
+  const pageDistanceMultiplier =
+    Number.isFinite(options.pageDistanceMultiplier) && options.pageDistanceMultiplier > 0
+      ? options.pageDistanceMultiplier
+      : distanceMultiplier;
+  const pageMinDistancePx =
+    Number.isFinite(options.pageMinDistancePx) && options.pageMinDistancePx > 0
+      ? options.pageMinDistancePx
+      : minDistancePx;
+
+  const containerState = await scrollContainer.evaluate((element, scrollOptions) => {
     const before = element.scrollTop;
     const maxScrollTop = Math.max(element.scrollHeight - element.clientHeight, 0);
-    const next = Math.min(before + Math.max(element.clientHeight * 0.9, 900), maxScrollTop);
+    const next = Math.min(
+      before +
+        Math.max(
+          element.clientHeight * scrollOptions.distanceMultiplier,
+          scrollOptions.minDistancePx
+        ),
+      maxScrollTop
+    );
     element.scrollTop = next;
     return {
       before,
@@ -1584,6 +1696,9 @@ async function advanceCommentScroll(page, scrollContainer) {
       maxScrollTop,
       strategy: "container"
     };
+  }, {
+    distanceMultiplier,
+    minDistancePx
   });
 
   if (containerState.after > containerState.before) {
@@ -1591,7 +1706,7 @@ async function advanceCommentScroll(page, scrollContainer) {
   }
 
   await scrollContainer.scrollIntoViewIfNeeded().catch(() => {});
-  await page.mouse.wheel(0, 1400);
+  await page.mouse.wheel(0, wheelDeltaY);
   await page.waitForTimeout(150);
 
   const wheelState = await scrollContainer.evaluate((element, before) => {
@@ -1610,14 +1725,21 @@ async function advanceCommentScroll(page, scrollContainer) {
     return wheelState;
   }
 
-  return page.evaluate(() => {
+  return page.evaluate((scrollOptions) => {
     const element =
       document.scrollingElement instanceof HTMLElement
         ? document.scrollingElement
         : document.documentElement;
     const before = element.scrollTop;
     const maxScrollTop = Math.max(element.scrollHeight - element.clientHeight, 0);
-    const next = Math.min(before + Math.max(window.innerHeight * 0.9, 900), maxScrollTop);
+    const next = Math.min(
+      before +
+        Math.max(
+          window.innerHeight * scrollOptions.pageDistanceMultiplier,
+          scrollOptions.pageMinDistancePx
+        ),
+      maxScrollTop
+    );
     element.scrollTop = next;
     return {
       before,
@@ -1625,7 +1747,75 @@ async function advanceCommentScroll(page, scrollContainer) {
       maxScrollTop,
       strategy: "page"
     };
+  }, {
+    pageDistanceMultiplier,
+    pageMinDistancePx
   });
+}
+
+async function aggressivelyAdvanceCommentScroll(
+  page,
+  scrollContainer,
+  options,
+  processedSignatures,
+  processedPlanIds
+) {
+  const attempts = [];
+  let previousFingerprint = await captureCommentListFingerprint(page);
+  let latestSnapshot = [];
+  let foundUnprocessed = false;
+
+  for (let index = 0; index < 10; index += 1) {
+    const state = await advanceCommentScroll(page, scrollContainer, {
+      distanceMultiplier: 2.2,
+      minDistancePx: 2200,
+      wheelDeltaY: 2600,
+      pageDistanceMultiplier: 1.8,
+      pageMinDistancePx: 1800
+    });
+    const listChangeWait = waitForCommentListChange(page, previousFingerprint, 1000);
+    await page.waitForTimeout(1000);
+    const listChanged = await listChangeWait;
+    attempts.push({
+      ...state,
+      listChanged
+    });
+
+    latestSnapshot = await extractCommentSnapshot(page);
+    foundUnprocessed = Boolean(
+      getNextReplyTarget(latestSnapshot, options, processedSignatures, processedPlanIds)
+    );
+    previousFingerprint = await captureCommentListFingerprint(page);
+
+    if (foundUnprocessed) {
+      break;
+    }
+  }
+
+  const fallbackState = {
+    before: 0,
+    after: 0,
+    maxScrollTop: 0,
+    strategy: "none",
+    listChanged: false
+  };
+  const lastAttempt = attempts[attempts.length - 1] ?? fallbackState;
+  const trailingAttempts = attempts.slice(-2);
+
+  return {
+    ...lastAttempt,
+    attempts: attempts.length,
+    anyMovement: attempts.some((attempt) => attempt.after > attempt.before),
+    anyListChange: attempts.some((attempt) => attempt.listChanged),
+    foundUnprocessed,
+    latestSnapshot,
+    reachedBottom:
+      attempts.length > 0 &&
+      lastAttempt.after >= lastAttempt.maxScrollTop &&
+      trailingAttempts.every(
+        (attempt) => attempt.after >= attempt.maxScrollTop || attempt.after === attempt.before
+      )
+  };
 }
 
 async function extractCommentSnapshot(page) {
@@ -1650,14 +1840,11 @@ async function extractCommentSnapshot(page) {
         .filter(Boolean);
 
     const normalizeNameLine = (value = "") => {
-      let username = normalize(value);
+      let username = normalize(value).replace(/\s+/g, "");
       let hasAuthorBadge = false;
 
-      if (username.endsWith(" 作者")) {
-        username = normalize(username.slice(0, -3));
-        hasAuthorBadge = true;
-      } else if (username.endsWith("作者") && username.length > 2) {
-        username = normalize(username.slice(0, -2));
+      if (username.endsWith("作者") && username.length > 2) {
+        username = username.slice(0, -2);
         hasAuthorBadge = true;
       }
 
@@ -2311,7 +2498,7 @@ function matchReplyPlan(comment, replyPlans, processedPlanIds) {
     return null;
   }
 
-  const commentUsername = normalizeText(comment.username).toLowerCase();
+  const commentUsername = normalizeUsername(comment.username).toLowerCase();
 
   for (const plan of replyPlans) {
     if (processedPlanIds.has(plan.id)) {
@@ -2322,7 +2509,7 @@ function matchReplyPlan(comment, replyPlans, processedPlanIds) {
       continue;
     }
 
-    if (normalizeText(plan.username).toLowerCase() !== commentUsername) {
+    if (normalizeUsername(plan.username).toLowerCase() !== commentUsername) {
       continue;
     }
 
@@ -2376,11 +2563,16 @@ async function inspectCommentActions(commentLocator, intendedReplyMessage = "") 
       return (text.includes("条回复") || text === "收起") && text.length <= 20;
     });
     const replyCandidate = candidates.find((node) => normalize(node.textContent || "") === "回复");
+    const editableValues = Array.from(root.querySelectorAll('[contenteditable="true"]'))
+      .map((node) => normalize(node.textContent || ""))
+      .filter(Boolean)
+      .slice(0, 2);
+    const rootText = normalize(root.innerText || "");
     const hasAuthorReply = candidates.some((node) => normalize(node.textContent || "") === "作者");
     const hasDuplicateReplyMessage =
       Boolean(normalizedReplyMessage) &&
       hasAuthorReply &&
-      normalize(root.innerText || "").includes(normalizedReplyMessage);
+      rootText.includes(normalizedReplyMessage);
 
     if (toggleCandidate instanceof HTMLElement) {
       toggleCandidate.setAttribute("data-codex-toggle-action", "true");
@@ -2395,7 +2587,10 @@ async function inspectCommentActions(commentLocator, intendedReplyMessage = "") 
       toggleText: normalize(toggleCandidate?.textContent || ""),
       hasReplyButton: replyCandidate instanceof HTMLElement,
       hasAuthorReply,
-      hasDuplicateReplyMessage
+      hasDuplicateReplyMessage,
+      openInputCount: root.querySelectorAll('[contenteditable="true"]').length,
+      editableValues,
+      textPreview: rootText.slice(0, 240)
     };
   }, intendedReplyMessage);
 }
@@ -2433,6 +2628,74 @@ async function waitForReplySendReady(page, commentLocator, timeoutMs, options = 
   }
 
   throw new Error(`Timed out waiting for the send button after ${effectiveTimeoutMs}ms.`);
+}
+
+async function waitForReplyConfirmation(page, commentLocator, replyMessage, options) {
+  const effectiveTimeoutMs = Math.min(
+    getEffectiveTimeout(options, options.replyTimeoutMs),
+    12000
+  );
+  const startedAt = Date.now();
+  let pollCount = 0;
+  let lastObservedState = null;
+
+  while (Date.now() - startedAt < effectiveTimeoutMs) {
+    pollCount += 1;
+    const visible = await commentLocator.isVisible().catch(() => false);
+    if (!visible) {
+      return {
+        confirmed: true,
+        reason: "comment_hidden",
+        pollCount,
+        elapsedMs: Date.now() - startedAt,
+        lastObservedState
+      };
+    }
+
+    const actionState = await inspectCommentActions(commentLocator, replyMessage).catch(() => null);
+    if (!actionState) {
+      return {
+        confirmed: true,
+        reason: "comment_detached",
+        pollCount,
+        elapsedMs: Date.now() - startedAt,
+        lastObservedState
+      };
+    }
+
+    lastObservedState = {
+      visible,
+      ...actionState
+    };
+
+    if (actionState.hasAuthorReply) {
+      return {
+        confirmed: true,
+        reason: "author_reply_visible",
+        pollCount,
+        elapsedMs: Date.now() - startedAt,
+        lastObservedState
+      };
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  return {
+    confirmed: false,
+    reason: "timeout",
+    pollCount,
+    elapsedMs: Date.now() - startedAt,
+    lastObservedState
+  };
+}
+
+function isResolvedReplyStatus(status) {
+  return (
+    status === "replied" ||
+    status === "skipped_already_replied" ||
+    status === "skipped_duplicate_reply_message"
+  );
 }
 
 async function safeReplyToComment(page, commentLocator, comment, options) {
@@ -2543,7 +2806,20 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
     stage = "wait_send_button";
     await waitForReplySendReady(page, commentLocator, options.replyTimeoutMs, options);
 
+    if (options.replyDryRun) {
+      logReplyFilterDebug("dry-run typed reply message", {
+        username: comment.username,
+        commentText: comment.commentText,
+        requestedReplyMessage: options.replyMessage
+      });
+      return {
+        ...result,
+        status: "dry_run_typed"
+      };
+    }
+
     const sendButton = commentLocator.getByText("发送", { exact: true }).first();
+    const previousFingerprint = await captureCommentListFingerprint(page);
     stage = "click_send_button";
     await sendButton.click();
     logReplyFilterDebug("clicked send button", {
@@ -2554,9 +2830,39 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
     stage = "settle_after_send";
     await page.waitForTimeout(options.replySettleMs);
 
-    logReplyFilterDebug("reply completed", {
+    stage = "verify_reply_result";
+    logReplyFilterDebug("waiting for reply confirmation", {
       username: comment.username,
-      commentText: comment.commentText
+      commentText: comment.commentText,
+      replyTimeoutMs: getEffectiveTimeout(options, options.replyTimeoutMs),
+      replySettleMs: options.replySettleMs
+    });
+    const listChanged = await waitForCommentListChange(
+      page,
+      previousFingerprint,
+      Math.min(getEffectiveTimeout(options, options.replyTimeoutMs), 6000)
+    );
+    const confirmation = await waitForReplyConfirmation(
+      page,
+      commentLocator,
+      options.replyMessage,
+      options
+    );
+
+    if (!confirmation.confirmed) {
+      throw new Error(
+        `Reply send was not confirmed after clicking send (listChanged=${String(listChanged)}).`
+      );
+    }
+
+    logReplyFilterDebug("reply confirmed", {
+      username: comment.username,
+      commentText: comment.commentText,
+      listChanged,
+      confirmationReason: confirmation.reason,
+      confirmationElapsedMs: confirmation.elapsedMs,
+      confirmationPollCount: confirmation.pollCount,
+      lastObservedState: confirmation.lastObservedState
     });
     return {
       ...result,
@@ -2580,8 +2886,10 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
 
 async function replyToComments(page, options) {
   await applyUnrepliedCommentsFilter(page, options);
+  await waitForCommentsArea(page, options);
 
   const scrollContainer = await markCommentScrollContainer(page);
+  await resetCommentScrollToTop(page, scrollContainer);
   const timeoutMs = getEffectiveTimeout(options, options.timeoutMs);
   const startedAt = Date.now();
   const processedSignatures = new Set();
@@ -2590,9 +2898,28 @@ async function replyToComments(page, options) {
   let repliedCount = 0;
   let lastProgressAt = startedAt;
   let loggedNoMatchSnapshot = false;
+  let stalledScrollAttempts = 0;
+  let bottomSearchBursts = 0;
+  let exitReason = "";
+  let exitDetails = null;
+
+  logReplyFilterDebug("reply flow configuration", {
+    timeoutMs,
+    replyTimeoutMs: options.replyTimeoutMs,
+    replySettleMs: options.replySettleMs,
+    replyLimit: options.replyLimit,
+    idleMs: options.idleMs,
+    effectiveIdleStopMs: options.idleMs * 2,
+    replyPlanCount: Array.isArray(options.replyPlans) ? options.replyPlans.length : 0
+  });
 
   while (Date.now() - startedAt < timeoutMs) {
     if (Array.isArray(options.replyPlans) && processedPlanIds.size >= options.replyPlans.length) {
+      exitReason = "all_reply_plans_resolved";
+      exitDetails = {
+        processedPlanCount: processedPlanIds.size
+      };
+      logReplyFilterDebug("reply flow completed: all reply plans resolved");
       break;
     }
 
@@ -2636,6 +2963,9 @@ async function replyToComments(page, options) {
           historyRepliedAt: duplicateHistoryEntry.repliedAt
         });
         lastProgressAt = Date.now();
+        loggedNoMatchSnapshot = false;
+        stalledScrollAttempts = 0;
+        bottomSearchBursts = 0;
         continue;
       }
 
@@ -2647,16 +2977,21 @@ async function replyToComments(page, options) {
         replyMessage
       });
 
-      processedSignatures.add(nextComment.signature);
-      if (plan) {
-        processedPlanIds.add(plan.id);
-      }
       results.push({
         ...replyResult,
         replyPlanId: plan?.id ?? null,
         requestedReplyMessage: replyMessage
       });
-      lastProgressAt = Date.now();
+      if (isResolvedReplyStatus(replyResult.status)) {
+        processedSignatures.add(nextComment.signature);
+        if (plan) {
+          processedPlanIds.add(plan.id);
+        }
+        lastProgressAt = Date.now();
+        loggedNoMatchSnapshot = false;
+        stalledScrollAttempts = 0;
+        bottomSearchBursts = 0;
+      }
 
       if (replyResult.status === "replied") {
         repliedCount += 1;
@@ -2678,7 +3013,28 @@ async function replyToComments(page, options) {
       }
 
       if (repliedCount >= options.replyLimit) {
+        exitReason = "reply_limit_reached";
+        exitDetails = {
+          replyLimit: options.replyLimit
+        };
+        logReplyFilterDebug("reply flow completed: reached reply limit", {
+          replyLimit: options.replyLimit
+        });
         break;
+      }
+
+      if (replyResult.status === "dry_run_typed") {
+        exitReason = "dry_run_typed";
+        exitDetails = {
+          username: nextComment.username,
+          commentText: nextComment.commentText
+        };
+        logReplyFilterDebug("reply flow paused in dry-run mode after typing one reply");
+        break;
+      }
+
+      if (!isResolvedReplyStatus(replyResult.status)) {
+        await page.waitForTimeout(600);
       }
 
       continue;
@@ -2702,33 +3058,108 @@ async function replyToComments(page, options) {
       loggedNoMatchSnapshot = true;
     }
 
-    const previousFingerprint = await captureCommentListFingerprint(page);
-    const scrollState = await advanceCommentScroll(page, scrollContainer);
-
-    await waitForCommentListChange(page, previousFingerprint, 1200);
-
-    const nextSnapshot = await extractCommentSnapshot(page);
-    const hasUnprocessed = Boolean(
-      getNextReplyTarget(nextSnapshot, options, processedSignatures, processedPlanIds)
+    const scrollState = await aggressivelyAdvanceCommentScroll(
+      page,
+      scrollContainer,
+      options,
+      processedSignatures,
+      processedPlanIds
     );
-    const reachedBottom =
-      scrollState.after === scrollState.before || scrollState.after >= scrollState.maxScrollTop;
+    logReplyFilterDebug("aggressive downward scan after missing reply target", {
+      attempts: scrollState.attempts,
+      strategy: scrollState.strategy,
+      anyMovement: scrollState.anyMovement,
+      anyListChange: scrollState.anyListChange,
+      foundUnprocessed: scrollState.foundUnprocessed,
+      reachedBottom: scrollState.reachedBottom
+    });
 
-    if (reachedBottom && !hasUnprocessed) {
-      break;
-    }
+    const nextSnapshot = Array.isArray(scrollState.latestSnapshot)
+      ? scrollState.latestSnapshot
+      : [];
+    const hasUnprocessed = scrollState.foundUnprocessed;
+    const hasVisibleComments = nextSnapshot.length > 0;
+    const scrollMoved = scrollState.anyMovement;
+    const reachedBottom = scrollState.reachedBottom;
 
     if (hasUnprocessed) {
       lastProgressAt = Date.now();
+      loggedNoMatchSnapshot = false;
+      stalledScrollAttempts = 0;
+      bottomSearchBursts = 0;
       continue;
     }
 
-    if (Date.now() - lastProgressAt >= options.idleMs) {
+    if (scrollMoved || scrollState.anyListChange) {
+      stalledScrollAttempts = 0;
+    } else {
+      stalledScrollAttempts += 1;
+    }
+
+    if (reachedBottom) {
+      bottomSearchBursts += 1;
+    } else {
+      bottomSearchBursts = 0;
+    }
+
+    if (!hasVisibleComments && !scrollMoved && !scrollState.anyListChange) {
+      exitReason = "no_comments_visible_after_scroll";
+      exitDetails = {
+        hasVisibleComments,
+        scrollMoved,
+        anyListChange: scrollState.anyListChange
+      };
+      logReplyFilterDebug("reply flow completed: no comments visible after scroll");
+      break;
+    }
+
+    if (reachedBottom && !hasUnprocessed && bottomSearchBursts >= 3) {
+      exitReason = "reached_bottom_repeatedly_without_match";
+      exitDetails = {
+        bottomSearchBursts
+      };
+      logReplyFilterDebug("reply flow completed: reached bottom repeatedly with no matching plans", {
+        bottomSearchBursts
+      });
+      break;
+    }
+
+    if (stalledScrollAttempts >= 8) {
+      exitReason = "stalled_scroll_attempts";
+      exitDetails = {
+        stalledScrollAttempts
+      };
+      logReplyFilterDebug("reply flow stopped after repeated stalled scroll attempts", {
+        stalledScrollAttempts
+      });
+      break;
+    }
+
+    if (Date.now() - lastProgressAt >= options.idleMs * 2 && stalledScrollAttempts >= 4) {
+      exitReason = "idle_window_without_new_matches";
+      exitDetails = {
+        idleMs: options.idleMs * 2,
+        stalledScrollAttempts
+      };
+      logReplyFilterDebug("reply flow stopped after idle window without new matches", {
+        idleMs: options.idleMs * 2,
+        stalledScrollAttempts
+      });
       break;
     }
   }
 
+  if (!exitReason) {
+    exitReason =
+      Date.now() - startedAt >= timeoutMs ? "reply_flow_total_timeout" : "reply_flow_finished";
+    exitDetails = {
+      timeoutMs,
+      elapsedMs: Date.now() - startedAt
+    };
+  }
+
   const skippedCount = results.filter((item) => item.status.startsWith("skipped_")).length;
+  const dryRunCount = results.filter((item) => item.status === "dry_run_typed").length;
   const errorCount = results.filter((item) => item.status === "error").length;
   const unmatchedPlans = Array.isArray(options.replyPlans)
     ? options.replyPlans
@@ -2741,9 +3172,31 @@ async function replyToComments(page, options) {
           replyMessage: plan.replyMessage
         }))
     : [];
+  const elapsedMs = Date.now() - startedAt;
+
+  logReplyFilterDebug("reply flow finished", {
+    exitReason,
+    exitDetails,
+    elapsedMs,
+    timeoutMs,
+    lastProgressAgeMs: Date.now() - lastProgressAt,
+    repliedCount,
+    totalProcessed: results.length,
+    matchedPlanCount: processedPlanIds.size,
+    unmatchedPlanCount: unmatchedPlans.length
+  });
 
   return {
+    replyDryRun: Boolean(options.replyDryRun),
+    exitReason,
+    exitDetails,
+    elapsedMs,
+    configuredTimeoutMs: timeoutMs,
+    configuredIdleMs: options.idleMs,
+    configuredReplyTimeoutMs: options.replyTimeoutMs,
+    configuredReplySettleMs: options.replySettleMs,
     repliedCount,
+    dryRunCount,
     skippedCount,
     errorCount,
     totalProcessed: results.length,
@@ -2818,8 +3271,126 @@ async function collectComments(page, options) {
     .map(sanitizeCollectedComment);
 }
 
+function dedupeOutputEntriesByUsernameAndCommentText(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return {
+      entries: Array.isArray(entries) ? entries : [],
+      removed: 0
+    };
+  }
+
+  const seen = new Set();
+  const dedupedEntries = [];
+  let removed = 0;
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      dedupedEntries.push(entry);
+      continue;
+    }
+
+    if (!("username" in entry) || !("commentText" in entry)) {
+      dedupedEntries.push(entry);
+      continue;
+    }
+
+    const key = `${String(entry.username ?? "")}\u0000${String(entry.commentText ?? "")}`;
+    if (seen.has(key)) {
+      removed += 1;
+      continue;
+    }
+
+    seen.add(key);
+    dedupedEntries.push(entry);
+  }
+
+  return {
+    entries: dedupedEntries,
+    removed
+  };
+}
+
+function prepareResultForOutput(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return result;
+  }
+
+  const nextResult = { ...result };
+  const dedupeSummary = [];
+
+  if (Array.isArray(nextResult.comments)) {
+    const dedupedComments = dedupeOutputEntriesByUsernameAndCommentText(nextResult.comments);
+    nextResult.comments = dedupedComments.entries;
+    if (typeof nextResult.count === "number") {
+      nextResult.count = dedupedComments.entries.length;
+    }
+    if (dedupedComments.removed > 0) {
+      dedupeSummary.push({
+        field: "comments",
+        removed: dedupedComments.removed,
+        remaining: dedupedComments.entries.length
+      });
+    }
+  }
+
+  if (Array.isArray(nextResult.results)) {
+    const dedupedResults = dedupeOutputEntriesByUsernameAndCommentText(nextResult.results);
+    nextResult.results = dedupedResults.entries;
+    if (typeof nextResult.totalProcessed === "number") {
+      nextResult.totalProcessed = dedupedResults.entries.length;
+    }
+    if (typeof nextResult.repliedCount === "number") {
+      nextResult.repliedCount = dedupedResults.entries.filter((item) => item?.status === "replied").length;
+    }
+    if (typeof nextResult.dryRunCount === "number") {
+      nextResult.dryRunCount = dedupedResults.entries.filter(
+        (item) => item?.status === "dry_run_typed"
+      ).length;
+    }
+    if (typeof nextResult.skippedCount === "number") {
+      nextResult.skippedCount = dedupedResults.entries.filter(
+        (item) => typeof item?.status === "string" && item.status.startsWith("skipped_")
+      ).length;
+    }
+    if (typeof nextResult.errorCount === "number") {
+      nextResult.errorCount = dedupedResults.entries.filter((item) => item?.status === "error").length;
+    }
+    if (dedupedResults.removed > 0) {
+      dedupeSummary.push({
+        field: "results",
+        removed: dedupedResults.removed,
+        remaining: dedupedResults.entries.length
+      });
+    }
+  }
+
+  if (Array.isArray(nextResult.unmatchedPlans)) {
+    const dedupedUnmatchedPlans = dedupeOutputEntriesByUsernameAndCommentText(
+      nextResult.unmatchedPlans
+    );
+    nextResult.unmatchedPlans = dedupedUnmatchedPlans.entries;
+    if (typeof nextResult.unmatchedPlanCount === "number") {
+      nextResult.unmatchedPlanCount = dedupedUnmatchedPlans.entries.length;
+    }
+    if (dedupedUnmatchedPlans.removed > 0) {
+      dedupeSummary.push({
+        field: "unmatchedPlans",
+        removed: dedupedUnmatchedPlans.removed,
+        remaining: dedupedUnmatchedPlans.entries.length
+      });
+    }
+  }
+
+  if (dedupeSummary.length > 0) {
+    logReplyFilterDebug("deduped final output entries", dedupeSummary);
+  }
+
+  return nextResult;
+}
+
 async function emitResult(result, outputPath) {
-  const payload = JSON.stringify(result, null, 2);
+  const outputResult = prepareResultForOutput(result);
+  const payload = JSON.stringify(outputResult, null, 2);
 
   if (!outputPath) {
     console.log(payload);
@@ -2870,6 +3441,9 @@ async function main() {
   }
   const isReplyMode = action === "reply_comments";
   const replyHistory = isReplyMode ? await loadReplyHistory() : null;
+  const replyFlowTimeoutConfig = isReplyMode
+    ? resolveReplyFlowTimeoutConfig(args, replyPlans.length)
+    : null;
   const runtimeBudget = args.maxRuntimeMs
     ? {
         deadline: Date.now() + args.maxRuntimeMs,
@@ -2885,7 +3459,10 @@ async function main() {
     workId: requestedWorkId || null,
     workTitle: requestedWorkTitle || null,
     maxRuntimeMs: args.maxRuntimeMs || null,
+    commentsTimeoutMs: args.commentsTimeoutMs,
+    commentsTimeoutExplicit: args.commentsTimeoutExplicit,
     replyCommentsFile: args.replyCommentsFile || null,
+    replyDryRun: args.replyDryRun,
     headless: args.headless
   });
   if (replyCommentsSource) {
@@ -2973,10 +3550,13 @@ async function main() {
     }
 
     if (isReplyMode) {
+      logReplyFilterDebug("resolved reply flow timeout", replyFlowTimeoutConfig);
       logReplyFilterDebug("entering reply flow", {
         selectedWork: getSelectedWorkOutput(targetWork),
         replyPlanCount: replyPlans.length,
-        replyLimit: args.replyLimit
+        replyLimit: args.replyLimit,
+        replyDryRun: args.replyDryRun,
+        replyFlowTimeout: replyFlowTimeoutConfig
       });
       const replySummary = await replyToComments(page, {
         ...runtimeBudget,
@@ -2984,10 +3564,11 @@ async function main() {
         replyHistory,
         selectedWork: targetWork,
         replyLimit: args.replyLimit,
+        replyDryRun: args.replyDryRun,
         replyTimeoutMs: args.replyTimeoutMs,
         replySettleMs: args.replySettleMs,
         replyTypeDelayMs: args.replyTypeDelayMs,
-        timeoutMs: args.commentsTimeoutMs,
+        timeoutMs: replyFlowTimeoutConfig.timeoutMs,
         idleMs: args.commentsIdleMs,
         uiTimeoutMs: args.uiTimeoutMs
       });
@@ -3000,8 +3581,10 @@ async function main() {
           selectedWork: getSelectedWorkOutput(targetWork),
           timeoutMs: args.maxRuntimeMs || null,
           replyCommentsFile: args.replyCommentsFile || null,
+          replyDryRun: args.replyDryRun,
           replyHistoryFile: replyHistory?.filePath ?? null,
           replyLimit: args.replyLimit,
+          replyFlowTimeout: replyFlowTimeoutConfig,
           ...replySummary
         },
         args.output

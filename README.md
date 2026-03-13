@@ -104,11 +104,22 @@ npm run comments -- \
 
 `--reply-comments-file` 会自动读取文件里的 `selectedWork.title` 来定位作品。当前匹配规则只按 `username` 匹配页面里的未回复评论；同一用户名有多条未回复评论时，会按页面当前顺序依次消耗。
 
+调试时可以加 `--dry-run`：
+
+```bash
+npm run comments -- \
+  --reply-comments-file comments-output/unreplied-comments.json \
+  --dry-run
+```
+
+`--dry-run` 只会把首个匹配到的回复内容输入到输入框里，不会点击“发送”，然后立即停止，方便你保留现场调试。
+
 ## 常用参数
 
 - `--timeout-ms <ms>`：整次运行的最大总时长
 - `--limit <n>`：未回复评论最多导出多少条，默认 `200`
 - `--reply-limit <n>`：单次最多回复多少条，默认 `20`
+- `--dry-run`：只输入首条回复内容，不真正发送，输入后立即停止，便于调试
 - `--output <path>`：结果输出文件
 - `--headless`：无头模式运行
 - `--user-data-dir <path>`：自定义 Playwright 用户目录
